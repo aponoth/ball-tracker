@@ -348,6 +348,7 @@ if temp_path:
                     ax3.axhline(df["Max Height (px from top)"].mean(), color='#2ecc71', linestyle='--', alpha=0.4)
                     ax3.set_ylabel("Max Height\n(px from top)", color='white', fontsize=8)
                     ax3.set_xlabel("Ball #", color='white', fontsize=9)
+                    ax3.xaxis.set_major_locator(plt.MaxNLocator(integer=True))
 
                     fig_trend.tight_layout()
                     trend_plot.pyplot(fig_trend)
