@@ -23,6 +23,9 @@ st.sidebar.header("Tracking")
 match_threshold = st.sidebar.slider("Match Distance (px)", 10, 300, 80)
 st.sidebar.caption("How far a ball can move between frames and still be considered the same ball. Decrease if separate balls are merging into one track; increase if fast balls are losing their track.")
 
+launch_zone_height = st.sidebar.slider("Launch Zone Height (px)", 20, 400, 150)
+st.sidebar.caption("Vertical size of the launch zone box. The box snaps to the right edge of the frame at the first detected ball. Only balls appearing inside it start a new track.")
+
 memory_frames = st.sidebar.slider("Gap Tolerance (frames)", 1, 30, 15)
 st.sidebar.caption("How many frames a ball can disappear (e.g. behind an object) before its track is finalized. Increase if tracks are ending prematurely.")
 
@@ -52,6 +55,10 @@ if 'active_tracks' not in st.session_state:
     st.session_state.active_tracks = []
 if 'next_ball_id' not in st.session_state:
     st.session_state.next_ball_id = 1
+if 'launch_zone' not in st.session_state:
+    st.session_state.launch_zone = None        # (center_x, center_y) once established
+if 'launch_zone_origins' not in st.session_state:
+    st.session_state.launch_zone_origins = []  # starting positions of first 2 finalized balls
 
 if st.sidebar.button("Reset All Data"):
     st.session_state.all_trajectories = []
@@ -61,6 +68,8 @@ if st.sidebar.button("Reset All Data"):
     st.session_state.paused = False
     st.session_state.next_ball_id = 1
     st.session_state.last_frame = None
+    st.session_state.launch_zone = None
+    st.session_state.launch_zone_origins = []
     st.rerun()
 
 
@@ -87,6 +96,7 @@ if temp_path:
             st.session_state.paused = False
             st.session_state.next_ball_id = 1
             st.session_state.last_frame = None
+            st.session_state.launch_zone = None
 
     cap = cv2.VideoCapture(temp_path)
     
@@ -134,11 +144,17 @@ if temp_path:
                 ax.set_facecolor('#1e1e1e')
                 for track in st.session_state.all_trajectories:
                     pts = np.array(track['path'])
-                    ax.plot(pts[:, 0], -pts[:, 1], color=track['color'], linewidth=1, alpha=0.4)
+                    ax.plot(pts[:, 0], -pts[:, 1], color=track['color'], linewidth=2, alpha=0.85)
+                    mid = len(pts) // 2
+                    ax.text(pts[mid, 0], -pts[mid, 1], str(track['id']),
+                            color=track['color'], fontsize=7, ha='center', va='bottom')
                 for track in st.session_state.active_tracks:
                     if len(track['path']) > 1:
                         pts = np.array(track['path'])
                         ax.plot(pts[:, 0], -pts[:, 1], color=track['color'], linewidth=4)
+                        mid = len(pts) // 2
+                        ax.text(pts[mid, 0], -pts[mid, 1], str(track['id']),
+                                color=track['color'], fontsize=7, ha='center', va='bottom')
                 graph_plot.pyplot(fig)
             if pause_btn.button("▶ Resume", key="pause_btn"):
                 st.session_state.paused = False
@@ -179,7 +195,6 @@ if temp_path:
                         if M["m00"] != 0:
                             center = (int(M["m10"] / M["m00"]), int(M["m01"] / M["m00"]))
                             current_centers.append(center)
-                            cv2.circle(frame, center, 15, (0, 255, 0), 2)
 
             # 2. Tracking & Velocity Calculation
             max_track_frames = int(video_fps * 3)  # max 3s per ball flight
@@ -202,6 +217,37 @@ if temp_path:
                     return True
                 cos_a = (vx*dx + vy*dy) / ((vx**2+vy**2)**0.5 * (dx**2+dy**2)**0.5)
                 return np.degrees(np.arccos(np.clip(cos_a, -1, 1))) < max_angle
+
+            def has_bounced(path, consistent_frames=3, min_speed=2):
+                """Detect any surface contact by spotting a velocity reversal in x or y.
+
+                - Ground bounce: ball was falling (dy > 0) then rises (dy < 0)
+                - Wall bounce:   ball was moving in one x direction then reverses
+                - Natural arc peak (dy negative -> positive) is intentionally ignored
+                  because that is normal ballistic flight, not a contact event.
+                """
+                if len(path) < consistent_frames + 2:
+                    return False
+
+                recent = path[-(consistent_frames + 2):]
+
+                def reversed_after_consistent(deltas, was_positive):
+                    sig = [d for d in deltas if abs(d) >= min_speed]
+                    if len(sig) < consistent_frames:
+                        return False
+                    prior, last = sig[:-1], sig[-1]
+                    if was_positive:
+                        return sum(d > 0 for d in prior) >= len(prior) - 1 and last < -min_speed
+                    else:
+                        return sum(d < 0 for d in prior) >= len(prior) - 1 and last > min_speed
+
+                dxs = [recent[i+1][0] - recent[i][0] for i in range(len(recent) - 1)]
+                dys = [recent[i+1][1] - recent[i][1] for i in range(len(recent) - 1)]
+
+                ground_bounce = reversed_after_consistent(dys, was_positive=True)   # falling -> rising
+                wall_bounce   = (reversed_after_consistent(dxs, was_positive=True)  # right -> left
+                              or reversed_after_consistent(dxs, was_positive=False)) # left -> right
+                return ground_bounce or wall_bounce
 
             def finalize(track):
                 p = track['path']
@@ -229,6 +275,16 @@ if temp_path:
                     "Launch Angle (°)": launch_angle,
                     "Max Height (px from top)": max_height_px,
                 })
+                # After the 2nd ball finalizes, lock the launch zone from their origins
+                if st.session_state.launch_zone is None and len(st.session_state.launch_zone_origins) < 2:
+                    st.session_state.launch_zone_origins.append(track['path'][0])
+                    if len(st.session_state.launch_zone_origins) == 2:
+                        origins = st.session_state.launch_zone_origins
+                        # Only calibrate vertical center; horizontal left edge stays
+                        # pinned to the same right-third used during calibration so
+                        # later balls aren't rejected for appearing slightly further left
+                        cy = int(np.mean([o[1] for o in origins]))
+                        st.session_state.launch_zone = cy
 
             new_active = []
             for center in current_centers:
@@ -249,29 +305,72 @@ if temp_path:
                     matched = True
 
                 if not matched:
-                    ball_id = st.session_state.next_ball_id
-                    st.session_state.next_ball_id += 1
-                    new_active.append({
-                        'id': ball_id,
-                        'path': [center],
-                        'color': colormap((ball_id * 0.618033988749895) % 1.0),
-                        'missing_count': 0,
-                        'start_time': current_timestamp
-                    })
+                    if st.session_state.launch_zone is None:
+                        # Calibration phase: only accept detections in the right third of the
+                        # frame so bounced/stray balls in the middle don't corrupt calibration
+                        in_zone = center[0] >= width * 2 // 3
+                    else:
+                        zy = st.session_state.launch_zone
+                        half_h = launch_zone_height
+                        in_zone = (center[0] >= width * 2 // 3 and
+                                   zy - half_h <= center[1] <= zy + half_h)
+                    if in_zone:
+                        ball_id = st.session_state.next_ball_id
+                        st.session_state.next_ball_id += 1
+                        new_active.append({
+                            'id': ball_id,
+                            'path': [center],
+                            'color': colormap((ball_id * 0.618033988749895) % 1.0),
+                            'missing_count': 0,
+                            'start_time': current_timestamp
+                        })
 
             for track in active_tracks:
                 track['missing_count'] += 1
                 track_age = len(track['path']) + track['missing_count']
                 expired = track_age > max_track_frames
                 lost = track['missing_count'] >= memory_frames
-                if (expired or lost) and len(track['path']) > 8:
+                if (expired or lost) and len(track['path']) > 4:
                     finalize(track)
                 elif not expired and not lost:
                     new_active.append(track)
             
+            # Finalize tracks whose ballistic arc was interrupted by a bounce
+            still_flying = []
+            for track in new_active:
+                if has_bounced(track['path']) and len(track['path']) > 4:
+                    finalize(track)
+                else:
+                    still_flying.append(track)
+            new_active = still_flying
+
             active_tracks = new_active
             st.session_state.active_tracks = active_tracks
             st.session_state.pause_frame = frame_count
+
+            # Draw launch zone box (shown only once it's locked from 2 calibration balls)
+            if st.session_state.launch_zone is not None:
+                zy = st.session_state.launch_zone
+                half_h = launch_zone_height
+                bx1, by1, bx2, by2 = width * 2 // 3, zy - half_h, width, zy + half_h
+                cv2.rectangle(frame, (bx1, by1), (bx2, by2), (0, 200, 255), 2, cv2.LINE_AA)
+                cv2.putText(frame, "launch zone", (max(bx1 - 4, 0), by1 - 8),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 200, 255), 1)
+            else:
+                remaining = 2 - len(st.session_state.launch_zone_origins)
+                cv2.putText(frame, f"calibrating: {remaining} ball(s) to go",
+                            (10, height - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 200, 255), 2)
+
+            # Draw tracking boxes with ball numbers
+            for track in active_tracks:
+                center = track['path'][-1]
+                r, g, b, _ = track['color']
+                color_bgr = (int(b * 255), int(g * 255), int(r * 255))
+                cv2.circle(frame, center, 15, color_bgr, 2)
+                label = str(track['id'])
+                (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)
+                cv2.putText(frame, label, (center[0] - tw // 2, center[1] - 20),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, color_bgr, 2)
 
             # 3. UI Updates
             total_ball_count = len(st.session_state.all_trajectories) + len(active_tracks)
@@ -298,12 +397,18 @@ if temp_path:
 
                 for track in st.session_state.all_trajectories:
                     pts = np.array(track['path'])
-                    ax.plot(pts[:, 0], -pts[:, 1], color=track['color'], linewidth=1, alpha=0.4)
+                    ax.plot(pts[:, 0], -pts[:, 1], color=track['color'], linewidth=2, alpha=0.85)
+                    mid = len(pts) // 2
+                    ax.text(pts[mid, 0], -pts[mid, 1], str(track['id']),
+                            color=track['color'], fontsize=7, ha='center', va='bottom')
 
                 for track in active_tracks:
                     if len(track['path']) > 1:
                         pts = np.array(track['path'])
                         ax.plot(pts[:, 0], -pts[:, 1], color=track['color'], linewidth=4)
+                        mid = len(pts) // 2
+                        ax.text(pts[mid, 0], -pts[mid, 1], str(track['id']),
+                                color=track['color'], fontsize=7, ha='center', va='bottom')
 
                 graph_plot.pyplot(fig)
 
@@ -365,5 +470,26 @@ if temp_path:
             time.sleep(delay)
 
         cap.release()
+
+        # Finalize any tracks still in flight when the video ended
+        for track in active_tracks:
+            if len(track['path']) > 4:
+                finalize(track)
+        active_tracks = []
+        st.session_state.active_tracks = []
+
+        # Final chart render with all trajectories
+        ax.clear()
+        ax.set_xlim(0, width)
+        ax.set_ylim(-height, 0)
+        ax.set_facecolor('#1e1e1e')
+        for track in st.session_state.all_trajectories:
+            pts = np.array(track['path'])
+            ax.plot(pts[:, 0], -pts[:, 1], color=track['color'], linewidth=2, alpha=0.85)
+            mid = len(pts) // 2
+            ax.text(pts[mid, 0], -pts[mid, 1], str(track['id']),
+                    color=track['color'], fontsize=7, ha='center', va='bottom')
+        graph_plot.pyplot(fig)
+
         status_bar.empty()
         st.success(f"Analysis complete — {len(st.session_state.all_trajectories)} balls detected.")
