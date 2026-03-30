@@ -56,9 +56,11 @@ if 'active_tracks' not in st.session_state:
 if 'next_ball_id' not in st.session_state:
     st.session_state.next_ball_id = 1
 if 'launch_zone' not in st.session_state:
-    st.session_state.launch_zone = None        # (center_x, center_y) once established
+    st.session_state.launch_zone = None        # calibrated center y once established
 if 'launch_zone_origins' not in st.session_state:
     st.session_state.launch_zone_origins = []  # starting positions of first 2 finalized balls
+if 'launch_direction' not in st.session_state:
+    st.session_state.launch_direction = None   # unit vector (dx, dy) of expected launch direction
 
 if st.sidebar.button("Reset All Data"):
     st.session_state.all_trajectories = []
@@ -70,6 +72,7 @@ if st.sidebar.button("Reset All Data"):
     st.session_state.last_frame = None
     st.session_state.launch_zone = None
     st.session_state.launch_zone_origins = []
+    st.session_state.launch_direction = None
     st.rerun()
 
 
@@ -97,6 +100,8 @@ if temp_path:
             st.session_state.next_ball_id = 1
             st.session_state.last_frame = None
             st.session_state.launch_zone = None
+            st.session_state.launch_zone_origins = []
+            st.session_state.launch_direction = None
 
     cap = cv2.VideoCapture(temp_path)
     
@@ -120,9 +125,178 @@ if temp_path:
         trend_plot = st.empty()
         log_table = st.empty()
 
-        lower_yellow = np.array([20, sat_val, 100]) 
+        lower_yellow = np.array([20, sat_val, 100])
         upper_yellow = np.array([35, 255, 255])
-        
+
+        # --- Helper functions (defined once before the processing loop) ---
+
+        def _initial_direction(path):
+            """Return normalised (dx, dy) unit vector from the first few frames, or None."""
+            n = min(4, len(path))
+            if n < 2:
+                return None
+            dx = np.mean([path[i+1][0] - path[i][0] for i in range(n - 1)])
+            dy = np.mean([path[i+1][1] - path[i][1] for i in range(n - 1)])
+            mag = (dx**2 + dy**2) ** 0.5
+            return (dx / mag, dy / mag) if mag > 0 else None
+
+        def predict_pos(path):
+            if len(path) >= 2:
+                dx = path[-1][0] - path[-2][0]
+                dy = path[-1][1] - path[-2][1]
+                return (path[-1][0] + dx, path[-1][1] + dy)
+            return path[-1]
+
+        def direction_ok(path, new_pos, max_angle=120):
+            if len(path) < 2:
+                return True
+            vx = path[-1][0] - path[-2][0]
+            vy = path[-1][1] - path[-2][1]
+            dx = new_pos[0] - path[-1][0]
+            dy = new_pos[1] - path[-1][1]
+            if (vx == 0 and vy == 0) or (dx == 0 and dy == 0):
+                return True
+            cos_a = (vx*dx + vy*dy) / ((vx**2+vy**2)**0.5 * (dx**2+dy**2)**0.5)
+            return np.degrees(np.arccos(np.clip(cos_a, -1, 1))) < max_angle
+
+        def has_bounced(path, consistent_frames=3, min_speed=2):
+            """Detect any surface contact by spotting a velocity reversal in x or y.
+            Ground bounce: falling (dy>0) then rising (dy<0).
+            Wall bounce: x direction reverses.
+            Natural arc peak (dy<0 → dy>0) is intentionally ignored.
+            """
+            if len(path) < consistent_frames + 2:
+                return False
+            recent = path[-(consistent_frames + 2):]
+
+            def reversed_after_consistent(deltas, was_positive):
+                sig = [d for d in deltas if abs(d) >= min_speed]
+                if len(sig) < consistent_frames:
+                    return False
+                prior, last = sig[:-1], sig[-1]
+                if was_positive:
+                    return sum(d > 0 for d in prior) >= len(prior) - 1 and last < -min_speed
+                else:
+                    return sum(d < 0 for d in prior) >= len(prior) - 1 and last > min_speed
+
+            dxs = [recent[i+1][0] - recent[i][0] for i in range(len(recent) - 1)]
+            dys = [recent[i+1][1] - recent[i][1] for i in range(len(recent) - 1)]
+            ground_bounce = reversed_after_consistent(dys, was_positive=True)
+            wall_bounce   = (reversed_after_consistent(dxs, was_positive=True) or
+                             reversed_after_consistent(dxs, was_positive=False))
+            return ground_bounce or wall_bounce
+
+        def finalize(track):
+            p = track['path']
+            n = min(4, len(p))
+            init_vel = sum(
+                np.linalg.norm(np.array(p[i+1]) - np.array(p[i])) * video_fps
+                for i in range(n - 1)
+            ) / (n - 1) if n > 1 else 0
+            if len(p) >= 2:
+                dx = np.mean([p[i+1][0] - p[i][0] for i in range(n - 1)])
+                dy = np.mean([p[i+1][1] - p[i][1] for i in range(n - 1)])
+                launch_angle = round(np.degrees(np.arctan2(-dy, dx)), 1)
+            else:
+                launch_angle = 0.0
+            max_height_px = min(pt[1] for pt in p)
+            st.session_state.all_trajectories.append(track)
+            st.session_state.ball_log.append({
+                "Ball #": track['id'],
+                "Launch Time (s)": round(track['start_time'], 2),
+                "Initial Velocity (px/s)": round(init_vel, 1),
+                "Launch Angle (°)": launch_angle,
+                "Max Height (px from top)": max_height_px,
+            })
+            # After 2nd ball finalizes, lock zone + launch direction
+            if st.session_state.launch_zone is None and len(st.session_state.launch_zone_origins) < 2:
+                st.session_state.launch_zone_origins.append({
+                    'pos': track['path'][0],
+                    'dir': _initial_direction(track['path']),
+                })
+                if len(st.session_state.launch_zone_origins) == 2:
+                    origins = st.session_state.launch_zone_origins
+                    cy = int(np.mean([o['pos'][1] for o in origins]))
+                    st.session_state.launch_zone = cy
+                    dirs = [o['dir'] for o in origins if o['dir'] is not None]
+                    if dirs:
+                        adx = np.mean([d[0] for d in dirs])
+                        ady = np.mean([d[1] for d in dirs])
+                        mag = (adx**2 + ady**2) ** 0.5
+                        if mag > 0:
+                            st.session_state.launch_direction = (adx / mag, ady / mag)
+
+        def build_seq_map():
+            """Map track['id'] → sequential ball number (sorted by launch time), matching the table."""
+            log_sorted = sorted(st.session_state.ball_log, key=lambda x: x['Launch Time (s)'])
+            return {entry['Ball #']: i + 1 for i, entry in enumerate(log_sorted)}
+
+        def render_trajectory_chart(all_trajs, live_tracks):
+            id_to_seq = build_seq_map()
+            ax.clear()
+            ax.set_xlim(0, width)
+            ax.set_ylim(-height, 0)
+            ax.set_facecolor('#1e1e1e')
+            for track in all_trajs:
+                pts = np.array(track['path'])
+                ax.plot(pts[:, 0], -pts[:, 1], color=track['color'], linewidth=2, alpha=0.85)
+                mid = len(pts) // 2
+                ax.text(pts[mid, 0], -pts[mid, 1],
+                        str(id_to_seq.get(track['id'], track['id'])),
+                        color=track['color'], fontsize=7, ha='center', va='bottom')
+            for track in live_tracks:
+                if len(track['path']) > 1:
+                    pts = np.array(track['path'])
+                    ax.plot(pts[:, 0], -pts[:, 1], color=track['color'], linewidth=4)
+                    mid = len(pts) // 2
+                    ax.text(pts[mid, 0], -pts[mid, 1],
+                            str(id_to_seq.get(track['id'], '…')),
+                            color=track['color'], fontsize=7, ha='center', va='bottom')
+            graph_plot.pyplot(fig)
+
+        def render_summary(df):
+            with summary_area.container():
+                st.markdown(f"### Balls: {len(df)}")
+                stats = pd.DataFrame({
+                    "Metric": ["Velocity (px/s)", "Launch Angle (°)", "Max Height (px from top)"],
+                    "Avg": [
+                        f"{df['Initial Velocity (px/s)'].mean():.0f}",
+                        f"{df['Launch Angle (°)'].mean():.1f}",
+                        f"{df['Max Height (px from top)'].mean():.0f}",
+                    ],
+                    "Std Dev": [
+                        f"{df['Initial Velocity (px/s)'].std():.0f}",
+                        f"{df['Launch Angle (°)'].std():.1f}",
+                        f"{df['Max Height (px from top)'].std():.0f}",
+                    ],
+                })
+                st.dataframe(stats, hide_index=True, use_container_width=True)
+            if len(df) >= 2:
+                fig_trend, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(8, 6), sharex=True)
+                fig_trend.patch.set_facecolor('#1e1e1e')
+                x = df["Ball"]
+                for sub_ax in (ax1, ax2, ax3):
+                    sub_ax.set_facecolor('#1e1e1e')
+                    sub_ax.tick_params(colors='white')
+                    sub_ax.spines[:].set_color('#444')
+                ax1.plot(x, df["Initial Velocity (px/s)"], 'o-', color='#00bfff')
+                ax1.axhline(df["Initial Velocity (px/s)"].mean(), color='#00bfff', linestyle='--', alpha=0.4)
+                ax1.set_ylabel("Init Velocity\n(px/s)", color='white', fontsize=8)
+                ax2.plot(x, df["Launch Angle (°)"], 'o-', color='#ff7f0e')
+                ax2.axhline(df["Launch Angle (°)"].mean(), color='#ff7f0e', linestyle='--', alpha=0.4)
+                ax2.set_ylabel("Launch Angle\n(°)", color='white', fontsize=8)
+                ax3.plot(x, df["Max Height (px from top)"], 'o-', color='#2ecc71')
+                ax3.axhline(df["Max Height (px from top)"].mean(), color='#2ecc71', linestyle='--', alpha=0.4)
+                ax3.set_ylabel("Max Height\n(px from top)", color='white', fontsize=8)
+                ax3.set_xlabel("Ball #", color='white', fontsize=9)
+                ax3.xaxis.set_major_locator(plt.MaxNLocator(integer=True))
+                fig_trend.tight_layout()
+                trend_plot.pyplot(fig_trend)
+                plt.close(fig_trend)
+            log_table.dataframe(df, hide_index=True, use_container_width=True)
+
+        # --- End helpers ---
+
         active_tracks = st.session_state.active_tracks if st.session_state.pause_frame > 0 else []
         fig, ax = plt.subplots(figsize=(6, 5))
         colormap = cm.get_cmap('gist_rainbow')
@@ -138,24 +312,8 @@ if temp_path:
             if st.session_state.last_frame is not None:
                 video_feed.image(st.session_state.last_frame)
             if st.session_state.all_trajectories or st.session_state.active_tracks:
-                ax.clear()
-                ax.set_xlim(0, width)
-                ax.set_ylim(-height, 0)
-                ax.set_facecolor('#1e1e1e')
-                for track in st.session_state.all_trajectories:
-                    pts = np.array(track['path'])
-                    ax.plot(pts[:, 0], -pts[:, 1], color=track['color'], linewidth=2, alpha=0.85)
-                    mid = len(pts) // 2
-                    ax.text(pts[mid, 0], -pts[mid, 1], str(track['id']),
-                            color=track['color'], fontsize=7, ha='center', va='bottom')
-                for track in st.session_state.active_tracks:
-                    if len(track['path']) > 1:
-                        pts = np.array(track['path'])
-                        ax.plot(pts[:, 0], -pts[:, 1], color=track['color'], linewidth=4)
-                        mid = len(pts) // 2
-                        ax.text(pts[mid, 0], -pts[mid, 1], str(track['id']),
-                                color=track['color'], fontsize=7, ha='center', va='bottom')
-                graph_plot.pyplot(fig)
+                render_trajectory_chart(st.session_state.all_trajectories,
+                                        st.session_state.active_tracks)
             if pause_btn.button("▶ Resume", key="pause_btn"):
                 st.session_state.paused = False
                 st.rerun()
@@ -198,93 +356,6 @@ if temp_path:
 
             # 2. Tracking & Velocity Calculation
             max_track_frames = int(video_fps * 3)  # max 3s per ball flight
-
-            def predict_pos(path):
-                if len(path) >= 2:
-                    dx = path[-1][0] - path[-2][0]
-                    dy = path[-1][1] - path[-2][1]
-                    return (path[-1][0] + dx, path[-1][1] + dy)
-                return path[-1]
-
-            def direction_ok(path, new_pos, max_angle=120):
-                if len(path) < 2:
-                    return True
-                vx = path[-1][0] - path[-2][0]
-                vy = path[-1][1] - path[-2][1]
-                dx = new_pos[0] - path[-1][0]
-                dy = new_pos[1] - path[-1][1]
-                if (vx == 0 and vy == 0) or (dx == 0 and dy == 0):
-                    return True
-                cos_a = (vx*dx + vy*dy) / ((vx**2+vy**2)**0.5 * (dx**2+dy**2)**0.5)
-                return np.degrees(np.arccos(np.clip(cos_a, -1, 1))) < max_angle
-
-            def has_bounced(path, consistent_frames=3, min_speed=2):
-                """Detect any surface contact by spotting a velocity reversal in x or y.
-
-                - Ground bounce: ball was falling (dy > 0) then rises (dy < 0)
-                - Wall bounce:   ball was moving in one x direction then reverses
-                - Natural arc peak (dy negative -> positive) is intentionally ignored
-                  because that is normal ballistic flight, not a contact event.
-                """
-                if len(path) < consistent_frames + 2:
-                    return False
-
-                recent = path[-(consistent_frames + 2):]
-
-                def reversed_after_consistent(deltas, was_positive):
-                    sig = [d for d in deltas if abs(d) >= min_speed]
-                    if len(sig) < consistent_frames:
-                        return False
-                    prior, last = sig[:-1], sig[-1]
-                    if was_positive:
-                        return sum(d > 0 for d in prior) >= len(prior) - 1 and last < -min_speed
-                    else:
-                        return sum(d < 0 for d in prior) >= len(prior) - 1 and last > min_speed
-
-                dxs = [recent[i+1][0] - recent[i][0] for i in range(len(recent) - 1)]
-                dys = [recent[i+1][1] - recent[i][1] for i in range(len(recent) - 1)]
-
-                ground_bounce = reversed_after_consistent(dys, was_positive=True)   # falling -> rising
-                wall_bounce   = (reversed_after_consistent(dxs, was_positive=True)  # right -> left
-                              or reversed_after_consistent(dxs, was_positive=False)) # left -> right
-                return ground_bounce or wall_bounce
-
-            def finalize(track):
-                p = track['path']
-                # Initial velocity: average speed over first 3 frames for stability
-                n = min(4, len(p))
-                init_vel = sum(
-                    np.linalg.norm(np.array(p[i+1]) - np.array(p[i])) * video_fps
-                    for i in range(n - 1)
-                ) / (n - 1) if n > 1 else 0
-                # Launch angle: direction of initial movement (averaged over first 3 frames)
-                # Positive = upward (y decreases going up in image coords)
-                if len(p) >= 2:
-                    dx = np.mean([p[i+1][0] - p[i][0] for i in range(n - 1)])
-                    dy = np.mean([p[i+1][1] - p[i][1] for i in range(n - 1)])
-                    launch_angle = round(np.degrees(np.arctan2(-dy, dx)), 1)  # negate dy: up = positive
-                else:
-                    launch_angle = 0.0
-                # Max height: minimum y in path (y=0 is top of frame)
-                max_height_px = min(pt[1] for pt in p)
-                st.session_state.all_trajectories.append(track)
-                st.session_state.ball_log.append({
-                    "Ball #": track['id'],
-                    "Launch Time (s)": round(track['start_time'], 2),
-                    "Initial Velocity (px/s)": round(init_vel, 1),
-                    "Launch Angle (°)": launch_angle,
-                    "Max Height (px from top)": max_height_px,
-                })
-                # After the 2nd ball finalizes, lock the launch zone from their origins
-                if st.session_state.launch_zone is None and len(st.session_state.launch_zone_origins) < 2:
-                    st.session_state.launch_zone_origins.append(track['path'][0])
-                    if len(st.session_state.launch_zone_origins) == 2:
-                        origins = st.session_state.launch_zone_origins
-                        # Only calibrate vertical center; horizontal left edge stays
-                        # pinned to the same right-third used during calibration so
-                        # later balls aren't rejected for appearing slightly further left
-                        cy = int(np.mean([o[1] for o in origins]))
-                        st.session_state.launch_zone = cy
 
             new_active = []
             for center in current_centers:
@@ -342,6 +413,26 @@ if temp_path:
                     finalize(track)
                 else:
                     still_flying.append(track)
+
+            # Drop tracks whose initial direction doesn't match the calibrated launch direction
+            if st.session_state.launch_direction is not None:
+                ldx, ldy = st.session_state.launch_direction
+                validated = []
+                for track in still_flying:
+                    if len(track['path']) < 3:
+                        validated.append(track)   # too few points to judge yet — keep
+                        continue
+                    d = _initial_direction(track['path'])
+                    if d is None:
+                        validated.append(track)
+                        continue
+                    cos_a = d[0] * ldx + d[1] * ldy
+                    angle = np.degrees(np.arccos(np.clip(cos_a, -1, 1)))
+                    if angle <= 60:               # within 60° of calibrated direction
+                        validated.append(track)
+                    # else: silently drop — ball is moving the wrong way
+                still_flying = validated
+
             new_active = still_flying
 
             active_tracks = new_active
@@ -373,10 +464,10 @@ if temp_path:
                             cv2.FONT_HERSHEY_SIMPLEX, 0.7, color_bgr, 2)
 
             # 3. UI Updates
-            total_ball_count = len(st.session_state.all_trajectories) + len(active_tracks)
+            finalized_count = len(st.session_state.all_trajectories)
             cv2.putText(frame, f"Time: {current_timestamp:.2f}s", (50, 50),
                         cv2.FONT_HERSHEY_SIMPLEX, 1.2, (255, 255, 255), 2)
-            cv2.putText(frame, f"Balls: {total_ball_count}", (50, 100),
+            cv2.putText(frame, f"Balls: {finalized_count}", (50, 100),
                         cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 255), 2)
 
             progress = frame_count / total_frames if total_frames > 0 else 0
@@ -390,76 +481,14 @@ if temp_path:
 
             t_graph_start = time.time()
             if frame_count % GRAPH_UPDATE_INTERVAL == 0:
-                ax.clear()
-                ax.set_xlim(0, width)
-                ax.set_ylim(-height, 0)
-                ax.set_facecolor('#1e1e1e')
-
-                for track in st.session_state.all_trajectories:
-                    pts = np.array(track['path'])
-                    ax.plot(pts[:, 0], -pts[:, 1], color=track['color'], linewidth=2, alpha=0.85)
-                    mid = len(pts) // 2
-                    ax.text(pts[mid, 0], -pts[mid, 1], str(track['id']),
-                            color=track['color'], fontsize=7, ha='center', va='bottom')
-
-                for track in active_tracks:
-                    if len(track['path']) > 1:
-                        pts = np.array(track['path'])
-                        ax.plot(pts[:, 0], -pts[:, 1], color=track['color'], linewidth=4)
-                        mid = len(pts) // 2
-                        ax.text(pts[mid, 0], -pts[mid, 1], str(track['id']),
-                                color=track['color'], fontsize=7, ha='center', va='bottom')
-
-                graph_plot.pyplot(fig)
-
+                render_trajectory_chart(st.session_state.all_trajectories, active_tracks)
+                if st.session_state.ball_log:
+                    df = pd.DataFrame(st.session_state.ball_log)
+                    df = df.sort_values("Launch Time (s)").reset_index(drop=True)
+                    df.insert(0, "Ball", range(1, len(df) + 1))
+                    df = df.drop(columns=["Ball #"])
+                    render_summary(df)
             t_graph_end = time.time()
-
-            # Update Log Table + Summary
-            if st.session_state.ball_log and frame_count % GRAPH_UPDATE_INTERVAL == 0:
-                df = pd.DataFrame(st.session_state.ball_log)
-                df = df.sort_values("Launch Time (s)").reset_index(drop=True)
-                df.insert(0, "Ball", range(1, len(df) + 1))
-                df = df.drop(columns=["Ball #"])
-
-                with summary_area.container():
-                    st.markdown("**Summary**")
-                    c1, c2, c3, c4, c5, c6, c7 = st.columns(7)
-                    c1.metric("Balls", len(df))
-                    c2.metric("Avg Velocity", f"{df['Initial Velocity (px/s)'].mean():.0f} px/s")
-                    c3.metric("Velocity Std Dev", f"{df['Initial Velocity (px/s)'].std():.0f} px/s")
-                    c4.metric("Avg Launch Angle", f"{df['Launch Angle (°)'].mean():.1f}°")
-                    c5.metric("Angle Std Dev", f"{df['Launch Angle (°)'].std():.1f}°")
-                    c6.metric("Best Height", f"{df['Max Height (px from top)'].min()} px")
-                    c7.metric("Height Std Dev", f"{df['Max Height (px from top)'].std():.0f} px")
-
-                if len(df) >= 2:
-                    fig_trend, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(8, 6), sharex=True)
-                    fig_trend.patch.set_facecolor('#1e1e1e')
-                    x = df["Ball"]
-                    for ax in (ax1, ax2, ax3):
-                        ax.set_facecolor('#1e1e1e')
-                        ax.tick_params(colors='white')
-                        ax.spines[:].set_color('#444')
-
-                    ax1.plot(x, df["Initial Velocity (px/s)"], 'o-', color='#00bfff')
-                    ax1.axhline(df["Initial Velocity (px/s)"].mean(), color='#00bfff', linestyle='--', alpha=0.4)
-                    ax1.set_ylabel("Init Velocity\n(px/s)", color='white', fontsize=8)
-
-                    ax2.plot(x, df["Launch Angle (°)"], 'o-', color='#ff7f0e')
-                    ax2.axhline(df["Launch Angle (°)"].mean(), color='#ff7f0e', linestyle='--', alpha=0.4)
-                    ax2.set_ylabel("Launch Angle\n(°)", color='white', fontsize=8)
-
-                    ax3.plot(x, df["Max Height (px from top)"], 'o-', color='#2ecc71')
-                    ax3.axhline(df["Max Height (px from top)"].mean(), color='#2ecc71', linestyle='--', alpha=0.4)
-                    ax3.set_ylabel("Max Height\n(px from top)", color='white', fontsize=8)
-                    ax3.set_xlabel("Ball #", color='white', fontsize=9)
-                    ax3.xaxis.set_major_locator(plt.MaxNLocator(integer=True))
-
-                    fig_trend.tight_layout()
-                    trend_plot.pyplot(fig_trend)
-                    plt.close(fig_trend)
-
-                log_table.dataframe(df, hide_index=True, use_container_width=True)
 
             t_total = time.time() - t_frame_start
             print(f"[frame {frame_count:04d}] total={t_total*1000:.1f}ms | cv={( t_cv - t_frame_start)*1000:.1f}ms | video_feed={(t_video - t_cv)*1000:.1f}ms | graph={(t_graph_end - t_graph_start)*1000:.1f}ms | balls={len(st.session_state.all_trajectories)}")
@@ -478,18 +507,15 @@ if temp_path:
         active_tracks = []
         st.session_state.active_tracks = []
 
-        # Final chart render with all trajectories
-        ax.clear()
-        ax.set_xlim(0, width)
-        ax.set_ylim(-height, 0)
-        ax.set_facecolor('#1e1e1e')
-        for track in st.session_state.all_trajectories:
-            pts = np.array(track['path'])
-            ax.plot(pts[:, 0], -pts[:, 1], color=track['color'], linewidth=2, alpha=0.85)
-            mid = len(pts) // 2
-            ax.text(pts[mid, 0], -pts[mid, 1], str(track['id']),
-                    color=track['color'], fontsize=7, ha='center', va='bottom')
-        graph_plot.pyplot(fig)
+        # Final render — trajectory chart + summary/table with all finalized balls
+        render_trajectory_chart(st.session_state.all_trajectories, [])
+        if st.session_state.ball_log:
+            df = pd.DataFrame(st.session_state.ball_log)
+            df = df.sort_values("Launch Time (s)").reset_index(drop=True)
+            df.insert(0, "Ball", range(1, len(df) + 1))
+            df = df.drop(columns=["Ball #"])
+            render_summary(df)
+        plt.close(fig)
 
         status_bar.empty()
         st.success(f"Analysis complete — {len(st.session_state.all_trajectories)} balls detected.")
