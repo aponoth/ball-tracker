@@ -1,0 +1,28 @@
+# Temporary video files
+temp_video.*
+
+# Generated analysis outputs
+ball_analysis_*.csv
+trajectory_chart_*.jpg
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+.venv
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db

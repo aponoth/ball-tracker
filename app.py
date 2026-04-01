@@ -5,44 +5,83 @@ import matplotlib.pyplot as plt
 import matplotlib.cm as cm
 import time
 import pandas as pd
+import os
+
+# Constants
+MIN_BALL_AREA = 100  # minimum contour area in pixels
+MIN_TRAJECTORY_LENGTH = 5  # minimum points for valid trajectory
+MAX_FLIGHT_TIME_SEC = 3  # maximum seconds to track a ball
+GRAPH_UPDATE_INTERVAL = 10  # frames between chart updates
+MIN_VELOCITY = 10  # px/s - minimum valid velocity (default, overridden by slider)
+SPATIAL_FILTER_MULTIPLIER = 3.0
+MIN_LAUNCH_ZONE_RADIUS = 50  # pixels
+MAX_LAUNCH_ZONE_RADIUS = 200  # pixels
 
 st.set_page_config(layout="wide")
 st.title("🏹 Advanced Ball Analytics Dashboard")
 
 # --- SIDEBAR CONTROLS ---
-st.sidebar.header("Detection")
+
+st.sidebar.markdown("## 🎬 Phase 1: Detection")
+st.sidebar.caption("⚠️ Changes require 'Rerun Analysis' button")
+st.sidebar.divider()
 
 sensitivity = st.sidebar.slider("Shape Sensitivity", 0.1, 1.0, 0.6, 0.05)
-st.sidebar.caption("How circular a blob must be to count as a ball. Increase if non-ball objects are being detected; decrease if real balls are being missed.")
+st.sidebar.caption("How circular a blob must be to count as a ball.")
 
 sat_val = st.sidebar.slider("Yellow Threshold", 50, 255, 120)
-st.sidebar.caption("Minimum color saturation to detect as yellow. Increase in bright/sunny conditions to reduce false positives; decrease if balls are being missed in shade.")
+st.sidebar.caption("Minimum color saturation to detect as yellow.")
 
-st.sidebar.header("Tracking")
+st.sidebar.divider()
+st.sidebar.markdown("## 📊 Phase 2: Filtering")
+st.sidebar.caption("✨ Updates instantly when adjusted")
+st.sidebar.divider()
 
-match_threshold = st.sidebar.slider("Match Distance (px)", 10, 300, 80)
-st.sidebar.caption("How far a ball can move between frames and still be considered the same ball. Decrease if separate balls are merging into one track; increase if fast balls are losing their track.")
+st.sidebar.markdown("**🎯 Launch Zone**")
+launch_time_percentile = st.sidebar.slider("Time Window (%)", 10, 50, 20, 5, key="launch_zone_slider")
+st.sidebar.caption("Use earliest X% of trajectories to define launch zone.")
 
-launch_zone_height = st.sidebar.slider("Launch Zone Height (px)", 20, 400, 150)
-st.sidebar.caption("Vertical size of the launch zone box. The box snaps to the right edge of the frame at the first detected ball. Only balls appearing inside it start a new track.")
+st.sidebar.markdown("**📏 Domain Filters**")
+angle_range = st.sidebar.slider("Launch Angle (°)", -45, 120, (20, 80), 5)
+min_angle, max_angle = angle_range
+st.sidebar.caption(f"Valid: {min_angle}° to {max_angle}°")
 
-memory_frames = st.sidebar.slider("Gap Tolerance (frames)", 1, 30, 15)
-st.sidebar.caption("How many frames a ball can disappear (e.g. behind an object) before its track is finalized. Increase if tracks are ending prematurely.")
+height_range = st.sidebar.slider("Max Height (px)", 0, 1200, (0, 1200), 50)
+min_height, max_height = height_range
+st.sidebar.caption(f"Valid: {min_height} to {max_height} px")
 
-st.sidebar.header("Playback")
+min_velocity = st.sidebar.slider("Min Velocity (px/s)", 0, 100, 10, 5)
+st.sidebar.caption(f"Minimum: {min_velocity} px/s")
 
-speed = st.sidebar.slider("Playback Speed", 0.1, 5.0, 1.0)
-st.sidebar.caption("Speed multiplier for video playback. Does not affect analysis accuracy.")
+st.sidebar.markdown("**🎯 Target Accuracy**")
+enable_accuracy = st.sidebar.checkbox("Show Accuracy Analysis", value=True)
+target_height_pct = st.sidebar.slider("Target Height (%)", 0, 100, 80, 5) if enable_accuracy else 80
+if enable_accuracy:
+    st.sidebar.caption(f"Landing accuracy at {target_height_pct}% height (descending only)")
 
-auto_fps = st.sidebar.checkbox("Auto-detect FPS", value=True)
-st.sidebar.caption("Read FPS from the video file. Uncheck only if velocity/timing values look wrong.")
-manual_fps = st.sidebar.number_input("Manual FPS Override", value=30) if not auto_fps else 30
+st.sidebar.markdown("**📈 Statistical**")
+enable_stats_filtering = st.sidebar.checkbox("IQR Outlier Removal", value=False)
+stats_sensitivity = st.sidebar.slider("IQR Threshold", 1.5, 4.0, 2.5, 0.5) if enable_stats_filtering else 2.5
+if enable_stats_filtering:
+    st.sidebar.caption(f"Threshold: {stats_sensitivity} (1.5=strict, 3.0=lenient)")
+
+# Fixed parameters (good defaults, rarely need tuning)
+match_threshold = 80  # pixels
+memory_frames = 15  # frames
+outlier_sensitivity = 3.0  # launch zone filter sensitivity
+speed = 1.0  # playback speed
+auto_fps = True
+manual_fps = 30
 
 # Initialize session state for persistent data
+if 'raw_trajectories' not in st.session_state:
+    st.session_state.raw_trajectories = []  # RAW data from video analysis (never modified)
+if 'raw_ball_log' not in st.session_state:
+    st.session_state.raw_ball_log = []  # RAW log (never modified)
 if 'all_trajectories' not in st.session_state:
-    st.session_state.all_trajectories = []
+    st.session_state.all_trajectories = []  # Filtered data for display
 if 'ball_log' not in st.session_state:
-    st.session_state.ball_log = []
+    st.session_state.ball_log = []  # Filtered log for display
 if 'video_path' not in st.session_state:
     st.session_state.video_path = None
 if 'paused' not in st.session_state:
@@ -55,14 +94,28 @@ if 'active_tracks' not in st.session_state:
     st.session_state.active_tracks = []
 if 'next_ball_id' not in st.session_state:
     st.session_state.next_ball_id = 1
-if 'launch_zone' not in st.session_state:
-    st.session_state.launch_zone = None        # calibrated center y once established
-if 'launch_zone_origins' not in st.session_state:
-    st.session_state.launch_zone_origins = []  # starting positions of first 2 finalized balls
-if 'launch_direction' not in st.session_state:
-    st.session_state.launch_direction = None   # unit vector (dx, dy) of expected launch direction
+if 'launch_zone_center' not in st.session_state:
+    st.session_state.launch_zone_center = None
+if 'launch_zone_radius' not in st.session_state:
+    st.session_state.launch_zone_radius = None
+if 'analysis_complete' not in st.session_state:
+    st.session_state.analysis_complete = False
+if 'files_saved' not in st.session_state:
+    st.session_state.files_saved = False
+if 'saved_csv' not in st.session_state:
+    st.session_state.saved_csv = None
+if 'saved_chart' not in st.session_state:
+    st.session_state.saved_chart = None
+if 'video_width' not in st.session_state:
+    st.session_state.video_width = 1920
+if 'video_height' not in st.session_state:
+    st.session_state.video_height = 1080
+if 'video_fps' not in st.session_state:
+    st.session_state.video_fps = 30
 
 if st.sidebar.button("Reset All Data"):
+    st.session_state.raw_trajectories = []
+    st.session_state.raw_ball_log = []
     st.session_state.all_trajectories = []
     st.session_state.ball_log = []
     st.session_state.active_tracks = []
@@ -70,13 +123,38 @@ if st.sidebar.button("Reset All Data"):
     st.session_state.paused = False
     st.session_state.next_ball_id = 1
     st.session_state.last_frame = None
-    st.session_state.launch_zone = None
-    st.session_state.launch_zone_origins = []
-    st.session_state.launch_direction = None
+    st.session_state.launch_zone_center = None
+    st.session_state.launch_zone_radius = None
+    st.session_state.analysis_complete = False
+    st.session_state.files_saved = False
+    st.session_state.saved_csv = None
+    st.session_state.saved_chart = None
     st.rerun()
 
 
-uploaded_file = st.file_uploader("Upload your MOV file", type=['mov', 'mp4'])
+col_upload, col_rerun_btn = st.columns([3, 1])
+
+with col_upload:
+    uploaded_file = st.file_uploader("Upload your MOV file", type=['mov', 'mp4'])
+
+with col_rerun_btn:
+    if st.button("🔄 Rerun Analysis", disabled=not st.session_state.video_path, use_container_width=True):
+        st.session_state.raw_trajectories = []
+        st.session_state.raw_ball_log = []
+        st.session_state.all_trajectories = []
+        st.session_state.ball_log = []
+        st.session_state.active_tracks = []
+        st.session_state.pause_frame = 0
+        st.session_state.paused = False
+        st.session_state.next_ball_id = 1
+        st.session_state.last_frame = None
+        st.session_state.launch_zone_center = None
+        st.session_state.launch_zone_radius = None
+        st.session_state.analysis_complete = False
+        st.session_state.files_saved = False
+        st.session_state.saved_csv = None
+        st.session_state.saved_chart = None
+        st.rerun()
 
 if uploaded_file:
     temp_path = "temp_video.mov"
@@ -88,21 +166,462 @@ elif st.session_state.video_path:
 else:
     temp_path = None
 
-if temp_path:
-    col_run, col_rerun = st.columns([3, 1])
-    with col_rerun:
-        if st.button("Rerun Analysis", disabled=not st.session_state.video_path):
-            st.session_state.all_trajectories = []
-            st.session_state.ball_log = []
-            st.session_state.active_tracks = []
-            st.session_state.pause_frame = 0
-            st.session_state.paused = False
-            st.session_state.next_ball_id = 1
-            st.session_state.last_frame = None
-            st.session_state.launch_zone = None
-            st.session_state.launch_zone_origins = []
-            st.session_state.launch_direction = None
+# Phase indicator (placed here so it knows the current state)
+if st.session_state.analysis_complete:
+    st.success("📊 **Phase 2: Interactive Filtering** - Adjust sliders to refine results")
+elif st.session_state.video_path and not st.session_state.analysis_complete:
+    if st.session_state.raw_trajectories:
+        st.info("🎬 **Phase 1: Video Analysis Complete** - Applying filters...")
+    else:
+        st.warning("🎬 **Phase 1: Video Analysis Running** - Processing video...")
+else:
+    st.info("📤 **Ready** - Upload a video to begin analysis")
 
+# Create UI layout (persistent across reruns)
+col1, col2 = st.columns([1, 1])
+video_feed = col1.empty()
+graph_plot = col2.empty()
+
+pause_btn = st.empty()
+status_bar = st.empty()
+summary_area = st.empty()
+distribution_plot_angle = st.empty()  # Dedicated container for angle distribution
+distribution_plot_height = st.empty()  # Dedicated container for height distribution
+trend_plot = st.empty()
+log_table = st.empty()
+
+# Create matplotlib figure for trajectory chart (reused across renders)
+fig, ax = plt.subplots(figsize=(6, 5))
+colormap = cm.get_cmap('gist_rainbow')
+
+# --- Unified Render Functions (module level, available to both phases) ---
+
+def render_trajectory_chart_unified(all_trajs, live_tracks, ball_log, width_dim, height_dim, show_target=False, target_height_pct=80):
+    """Unified trajectory chart renderer for both phases."""
+    def build_seq_map(ball_log):
+        if not ball_log:
+            return {}
+        log_sorted = sorted(ball_log, key=lambda x: x['Launch Time (s)'])
+        return {entry['Ball #']: i + 1 for i, entry in enumerate(log_sorted)}
+
+    id_to_seq = build_seq_map(ball_log)
+    ax.clear()
+    ax.set_facecolor('#1e1e1e')
+
+    # Draw target line if accuracy analysis is enabled
+    if show_target:
+        target_y = int(height_dim * target_height_pct / 100)
+        ax.axhline(-target_y, color='red', linestyle='--', linewidth=2, alpha=0.6, label=f'Target @ {target_height_pct}%')
+
+    # Draw launch zone if available
+    if st.session_state.launch_zone_center is not None:
+        center_x, center_y = st.session_state.launch_zone_center
+        radius = st.session_state.launch_zone_radius
+        circle = plt.Circle((center_x, -center_y), radius,
+                           color='cyan', fill=False, linewidth=2,
+                           linestyle='--', alpha=0.6, label='Launch Zone')
+        ax.add_patch(circle)
+        ax.plot(center_x, -center_y, 'x', color='cyan', markersize=10, markeredgewidth=2)
+
+    for track in all_trajs:
+        pts = np.array(track['path'])
+        ax.plot(pts[:, 0], -pts[:, 1], color=track['color'], linewidth=1, alpha=0.85)
+        # Label at end of trajectory (no box)
+        end_idx = -1
+        ax.text(pts[end_idx, 0], -pts[end_idx, 1],
+                str(id_to_seq.get(track['id'], track['id'])),
+                color=track['color'], fontsize=10, fontweight='bold',
+                ha='center', va='center')
+    for track in live_tracks:
+        if len(track['path']) > 1:
+            pts = np.array(track['path'])
+            ax.plot(pts[:, 0], -pts[:, 1], color=track['color'], linewidth=2)
+            # Label at end for live tracks (no box)
+            end_idx = -1
+            ax.text(pts[end_idx, 0], -pts[end_idx, 1],
+                    str(id_to_seq.get(track['id'], '…')),
+                    color=track['color'], fontsize=10, fontweight='bold',
+                    ha='center', va='center')
+
+    # Autoscale axes to fit data with padding
+    ax.autoscale(enable=True, axis='both', tight=False)
+    ax.margins(0.05)  # 5% padding around data
+    graph_plot.pyplot(fig)
+
+def render_summary_unified(df, accuracy_data=None):
+    """Unified summary renderer for both phases.
+
+    Args:
+        df: Ball log dataframe
+        accuracy_data: Optional dict from calculate_target_accuracy with intercept_map
+    """
+    with summary_area.container():
+        st.markdown(f"### Balls: {len(df)}")
+
+        # Add target distance column if accuracy data available
+        display_df = df.copy()
+        if accuracy_data is not None and 'intercept_map' in accuracy_data:
+            # Add target distance for each ball
+            target_distances = []
+            target_positions = []
+            extrapolated_flags = []
+
+            for _, row in display_df.iterrows():
+                ball_id = row.get('Ball #', None)  # May have been dropped
+                if ball_id and ball_id in accuracy_data['intercept_map']:
+                    info = accuracy_data['intercept_map'][ball_id]
+                    target_distances.append(round(info['target_distance'], 1))
+                    target_positions.append(round(info['target_x'], 1))
+                    extrapolated_flags.append('*' if info['extrapolated'] else '')
+                else:
+                    target_distances.append(None)
+                    target_positions.append(None)
+                    extrapolated_flags.append('')
+
+            display_df['Target X (px)'] = target_positions
+            display_df['Target Distance (px)'] = target_distances
+            display_df['Extrap'] = extrapolated_flags
+
+        # Drop Ball # column (internal ID, not useful to user)
+        if 'Ball #' in display_df.columns:
+            display_df = display_df.drop(columns=['Ball #'])
+
+        # Update stats to include target distance if available
+        metrics = ["Velocity (px/s)", "Launch Angle (°)", "Max Height (px from top)"]
+        avgs = [
+            f"{df['Initial Velocity (px/s)'].mean():.0f}",
+            f"{df['Launch Angle (°)'].mean():.1f}",
+            f"{df['Max Height (px from top)'].mean():.0f}",
+        ]
+        stds = [
+            f"{df['Initial Velocity (px/s)'].std():.0f}",
+            f"{df['Launch Angle (°)'].std():.1f}",
+            f"{df['Max Height (px from top)'].std():.0f}",
+        ]
+
+        if 'Target Distance (px)' in display_df.columns:
+            target_dists = display_df['Target Distance (px)'].dropna()
+            if len(target_dists) > 0:
+                metrics.append("Target Distance (px)")
+                avgs.append(f"{target_dists.mean():.0f}")
+                stds.append(f"{target_dists.std():.0f}")
+
+        stats = pd.DataFrame({
+            "Metric": metrics,
+            "Avg": avgs,
+            "Std Dev": stds,
+        })
+        st.dataframe(stats, hide_index=True, use_container_width=True)
+
+    # Add distribution plots for launch angle and max height
+    if len(df) >= 3:
+        # Launch Angle Distribution
+        fig_dist_angle, ax_dist_angle = plt.subplots(figsize=(8, 3))
+        fig_dist_angle.patch.set_facecolor('#1e1e1e')
+        ax_dist_angle.set_facecolor('#1e1e1e')
+        ax_dist_angle.tick_params(colors='white')
+        ax_dist_angle.spines[:].set_color('#444')
+
+        angles = df['Launch Angle (°)']
+        ax_dist_angle.hist(angles, bins=min(20, len(df)), color='#ff7f0e', alpha=0.7, edgecolor='white', linewidth=0.5)
+        ax_dist_angle.axvline(angles.mean(), color='red', linestyle='--', linewidth=2, label=f'Mean: {angles.mean():.1f}°')
+        ax_dist_angle.axvline(angles.median(), color='cyan', linestyle='--', linewidth=2, label=f'Median: {angles.median():.1f}°')
+        ax_dist_angle.set_xlabel('Launch Angle (°)', color='white', fontsize=9)
+        ax_dist_angle.set_ylabel('Count', color='white', fontsize=9)
+        ax_dist_angle.set_title('Launch Angle Distribution', color='white', fontsize=10)
+        ax_dist_angle.legend(loc='upper right', facecolor='#1e1e1e', edgecolor='#444', labelcolor='white')
+        ax_dist_angle.grid(True, alpha=0.2, color='white')
+        distribution_plot_angle.pyplot(fig_dist_angle)
+        plt.close(fig_dist_angle)
+
+        # Max Height Distribution
+        fig_dist_height, ax_dist_height = plt.subplots(figsize=(8, 3))
+        fig_dist_height.patch.set_facecolor('#1e1e1e')
+        ax_dist_height.set_facecolor('#1e1e1e')
+        ax_dist_height.tick_params(colors='white')
+        ax_dist_height.spines[:].set_color('#444')
+
+        heights = df['Max Height (px from top)']
+        ax_dist_height.hist(heights, bins=min(20, len(df)), color='#2ecc71', alpha=0.7, edgecolor='white', linewidth=0.5)
+        ax_dist_height.axvline(heights.mean(), color='red', linestyle='--', linewidth=2, label=f'Mean: {heights.mean():.0f}px')
+        ax_dist_height.axvline(heights.median(), color='cyan', linestyle='--', linewidth=2, label=f'Median: {heights.median():.0f}px')
+        ax_dist_height.set_xlabel('Max Height (px from top)', color='white', fontsize=9)
+        ax_dist_height.set_ylabel('Count', color='white', fontsize=9)
+        ax_dist_height.set_title('Max Height Distribution', color='white', fontsize=10)
+        ax_dist_height.legend(loc='upper right', facecolor='#1e1e1e', edgecolor='#444', labelcolor='white')
+        ax_dist_height.grid(True, alpha=0.2, color='white')
+        distribution_plot_height.pyplot(fig_dist_height)
+        plt.close(fig_dist_height)
+    else:
+        distribution_plot_angle.empty()  # Clear if not enough data
+        distribution_plot_height.empty()
+
+    # Trend charts over time
+    if len(df) >= 2:
+        fig_trend, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(8, 6), sharex=True)
+        fig_trend.patch.set_facecolor('#1e1e1e')
+        x = df["Launch Time (s)"]
+        ball_numbers = df["Ball"]
+        for sub_ax in (ax1, ax2, ax3):
+            sub_ax.set_facecolor('#1e1e1e')
+            sub_ax.tick_params(colors='white')
+            sub_ax.spines[:].set_color('#444')
+        # Velocity plot with ball number labels
+        ax1.plot(x, df["Initial Velocity (px/s)"], 'o-', color='#00bfff')
+        ax1.axhline(df["Initial Velocity (px/s)"].mean(), color='#00bfff', linestyle='--', alpha=0.4)
+        ax1.set_ylabel("Init Velocity\n(px/s)", color='white', fontsize=8)
+        # Add ball number labels to velocity plot
+        for i, (time, vel, ball_num) in enumerate(zip(x, df["Initial Velocity (px/s)"], ball_numbers)):
+            ax1.annotate(str(ball_num), (time, vel), textcoords="offset points",
+                        xytext=(0, 8), ha='center', fontsize=7, color='#00bfff', alpha=0.7)
+        ax2.plot(x, df["Launch Angle (°)"], 'o-', color='#ff7f0e')
+        ax2.axhline(df["Launch Angle (°)"].mean(), color='#ff7f0e', linestyle='--', alpha=0.4)
+        ax2.set_ylabel("Launch Angle\n(°)", color='white', fontsize=8)
+        ax3.plot(x, df["Max Height (px from top)"], 'o-', color='#2ecc71')
+        ax3.axhline(df["Max Height (px from top)"].mean(), color='#2ecc71', linestyle='--', alpha=0.4)
+        ax3.set_ylabel("Max Height\n(px from top)", color='white', fontsize=8)
+        ax3.set_xlabel("Time (s)", color='white', fontsize=9)
+        fig_trend.tight_layout()
+        trend_plot.pyplot(fig_trend)
+        plt.close(fig_trend)
+
+    log_table.dataframe(display_df, hide_index=True, use_container_width=True)
+
+def calculate_target_accuracy(trajectories, ball_log, target_y_px, frame_height):
+    """Calculate where each trajectory crosses a target height on DESCENDING path (or extrapolate).
+
+    Returns dict with accuracy metrics AND intercept_map for joining with ball_log.
+    """
+    intercepts = []
+
+    # Create mapping of Ball # to sequential number (sorted by time)
+    sorted_log = sorted(ball_log, key=lambda x: x['Launch Time (s)'])
+    ball_id_to_seq = {entry['Ball #']: i + 1 for i, entry in enumerate(sorted_log)}
+
+    for track, log_entry in zip(trajectories, ball_log):
+        path = track['path']
+        ball_num = ball_id_to_seq.get(track['id'], '?')
+
+        # Find peak (highest point = minimum Y value)
+        y_values = [pt[1] for pt in path]
+        peak_idx = y_values.index(min(y_values))
+
+        # Look for intercept AFTER peak (descending portion)
+        descending_path = path[peak_idx:]
+        found_intercept = False
+
+        for i in range(len(descending_path) - 1):
+            y1, y2 = descending_path[i][1], descending_path[i+1][1]
+            # Check if descending (y increasing) and crosses target
+            if y1 < target_y_px <= y2:
+                # Linear interpolation to find exact X position
+                t = (target_y_px - y1) / (y2 - y1)
+                x_intercept = descending_path[i][0] + t * (descending_path[i+1][0] - descending_path[i][0])
+                intercepts.append({
+                    'ball_id': track['id'],
+                    'ball_num': ball_num,
+                    'x': x_intercept,
+                    'y': target_y_px,
+                    'launch_time': log_entry['Launch Time (s)'],
+                    'extrapolated': False
+                })
+                found_intercept = True
+                break
+
+        # If no intercept found and trajectory ended early, extrapolate
+        if not found_intercept and len(descending_path) >= 3:
+            last_y = descending_path[-1][1]
+            # Only extrapolate if trajectory ended above target (hasn't reached it yet)
+            if last_y < target_y_px:
+                # Use last 3 points to estimate velocity
+                p1, p2, p3 = descending_path[-3], descending_path[-2], descending_path[-1]
+                vx = (p3[0] - p1[0]) / 2  # average horizontal velocity
+                vy = (p3[1] - p1[1]) / 2  # average vertical velocity (positive = falling)
+
+                # Extrapolate: how many steps to reach target?
+                if vy > 0.5:  # Must be descending
+                    steps_needed = (target_y_px - p3[1]) / vy
+                    x_extrapolated = p3[0] + vx * steps_needed
+
+                    # Sanity check: don't extrapolate too far
+                    if 0 < steps_needed < 50:  # reasonable extrapolation range
+                        intercepts.append({
+                            'ball_id': track['id'],
+                            'ball_num': ball_num,
+                            'x': x_extrapolated,
+                            'y': target_y_px,
+                            'launch_time': log_entry['Launch Time (s)'],
+                            'extrapolated': True
+                        })
+                        found_intercept = True
+
+    if not intercepts:
+        return None
+
+    # Calculate accuracy metrics
+    x_positions = np.array([i['x'] for i in intercepts])
+    mean_x = np.mean(x_positions)
+    std_x = np.std(x_positions)
+
+    # CEP (Circular Error Probable) - radius containing 50% of shots
+    distances_from_mean = np.abs(x_positions - mean_x)
+    cep = np.median(distances_from_mean)
+
+    # R95 - radius containing 95% of shots
+    r95 = np.percentile(distances_from_mean, 95)
+
+    # Create mapping of ball_id to target info for table augmentation
+    intercept_map = {}
+    for intercept in intercepts:
+        dist_from_mean = abs(intercept['x'] - mean_x)
+        intercept_map[intercept['ball_id']] = {
+            'target_x': intercept['x'],
+            'target_distance': dist_from_mean,
+            'extrapolated': intercept.get('extrapolated', False)
+        }
+
+    return {
+        'intercepts': intercepts,
+        'mean_x': mean_x,
+        'std_x': std_x,
+        'cep': cep,
+        'r95': r95,
+        'min_x': np.min(x_positions),
+        'max_x': np.max(x_positions),
+        'spread': np.max(x_positions) - np.min(x_positions),
+        'intercept_map': intercept_map
+    }
+
+def render_accuracy_analysis(accuracy_data, trajectories, target_height_pct, frame_width, frame_height):
+    """Render target accuracy visualization using pre-calculated accuracy data."""
+    if accuracy_data is None:
+        target_y_px = int(frame_height * target_height_pct / 100)
+        st.warning(f"⚠️ No trajectories reach target height ({target_height_pct}% = {target_y_px}px from top)")
+        return
+
+    accuracy = accuracy_data
+    target_y_px = int(frame_height * target_height_pct / 100)
+    st.markdown("### 🎯 Target Accuracy Analysis")
+
+    # Metrics
+    col1, col2, col3, col4 = st.columns(4)
+    with col1:
+        st.metric("Mean X Position", f"{accuracy['mean_x']:.0f} px")
+    with col2:
+        st.metric("Spread (σ)", f"{accuracy['std_x']:.0f} px")
+    with col3:
+        st.metric("CEP (50%)", f"{accuracy['cep']:.0f} px")
+    with col4:
+        st.metric("R95 (95%)", f"{accuracy['r95']:.0f} px")
+
+    # Visualization
+    fig_acc, (ax_top, ax_bottom) = plt.subplots(2, 1, figsize=(10, 6))
+    fig_acc.patch.set_facecolor('#1e1e1e')
+
+    # Top: Trajectory chart with target line
+    ax_top.set_facecolor('#1e1e1e')
+    ax_top.tick_params(colors='white')
+    ax_top.spines[:].set_color('#444')
+
+    for track in trajectories:
+        pts = np.array(track['path'])
+        ax_top.plot(pts[:, 0], pts[:, 1], color=track['color'], linewidth=1, alpha=0.5)
+
+        # Mark peak (apex) of each trajectory
+        peak_idx = np.argmin(pts[:, 1])  # Minimum Y = highest point
+        ax_top.plot(pts[peak_idx, 0], pts[peak_idx, 1], 'x', color=track['color'], markersize=6, markeredgewidth=2)
+
+    # Draw target line
+    ax_top.axhline(target_y_px, color='red', linestyle='--', linewidth=2, label=f'Target @ {target_height_pct}%')
+
+    # Mark intercepts (different style for extrapolated vs actual)
+    extrapolated_labeled = False
+    actual_labeled = False
+    for intercept in accuracy['intercepts']:
+        if intercept.get('extrapolated', False):
+            # Hollow circle for extrapolated
+            label = 'Extrapolated' if not extrapolated_labeled else ''
+            ax_top.plot(intercept['x'], intercept['y'], 'o', color='none', markersize=10,
+                       markeredgecolor='orange', markeredgewidth=2, label=label)
+            extrapolated_labeled = True
+        else:
+            # Filled circle for actual intercepts
+            label = 'Actual' if not actual_labeled else ''
+            ax_top.plot(intercept['x'], intercept['y'], 'o', color='yellow', markersize=8,
+                       markeredgecolor='red', markeredgewidth=2, label=label)
+            actual_labeled = True
+
+    ax_top.set_xlim(0, frame_width)
+    ax_top.set_ylim(frame_height, 0)  # Invert Y axis (normal image coordinates)
+    ax_top.set_xlabel('X Position (px)', color='white')
+    ax_top.set_ylabel('Y Position (px)', color='white')
+    ax_top.set_title('Trajectories with Target Line (X = apex, circles = descending intercept)', color='white', fontsize=9)
+    ax_top.legend(facecolor='#1e1e1e', edgecolor='#444', labelcolor='white')
+    ax_top.grid(True, alpha=0.2, color='white')
+
+    # Bottom: Accuracy distribution at target height
+    ax_bottom.set_facecolor('#1e1e1e')
+    ax_bottom.tick_params(colors='white')
+    ax_bottom.spines[:].set_color('#444')
+
+    x_positions = [i['x'] for i in accuracy['intercepts']]
+    ball_nums = [i['ball_num'] for i in accuracy['intercepts']]
+    times = [i['launch_time'] for i in accuracy['intercepts']]
+    extrapolated = [i.get('extrapolated', False) for i in accuracy['intercepts']]
+
+    # Scatter plot: X position vs time (different colors for actual vs extrapolated)
+    extrap_labeled_scatter = False
+    actual_labeled_scatter = False
+    for t, x, extrap in zip(times, x_positions, extrapolated):
+        if extrap:
+            label = 'Extrapolated' if not extrap_labeled_scatter else ''
+            ax_bottom.scatter(t, x, c='orange', s=100, alpha=0.7, edgecolors='white', marker='s', label=label)
+            extrap_labeled_scatter = True
+        else:
+            label = 'Actual' if not actual_labeled_scatter else ''
+            ax_bottom.scatter(t, x, c='cyan', s=100, alpha=0.7, edgecolors='white', marker='o', label=label)
+            actual_labeled_scatter = True
+
+    # Label with ball numbers
+    for x, t, bn, extrap in zip(x_positions, times, ball_nums, extrapolated):
+        color = 'orange' if extrap else 'cyan'
+        ax_bottom.annotate(str(bn), (t, x), fontsize=8, color=color, ha='center', va='bottom')
+
+    # Mean line and error bands
+    ax_bottom.axhline(accuracy['mean_x'], color='green', linestyle='-', linewidth=2, label=f"Mean: {accuracy['mean_x']:.0f}px")
+    ax_bottom.axhline(accuracy['mean_x'] + accuracy['std_x'], color='yellow', linestyle='--', linewidth=1, alpha=0.6, label=f'±1σ: {accuracy['std_x']:.0f}px')
+    ax_bottom.axhline(accuracy['mean_x'] - accuracy['std_x'], color='yellow', linestyle='--', linewidth=1, alpha=0.6)
+    ax_bottom.axhline(accuracy['mean_x'] + 2*accuracy['std_x'], color='orange', linestyle=':', linewidth=1, alpha=0.4, label=f'±2σ')
+    ax_bottom.axhline(accuracy['mean_x'] - 2*accuracy['std_x'], color='orange', linestyle=':', linewidth=1, alpha=0.4)
+
+    ax_bottom.set_xlabel('Launch Time (s)', color='white')
+    ax_bottom.set_ylabel('X Position at Target (px)', color='white')
+    ax_bottom.set_title(f'Landing Accuracy at {target_height_pct}% Height - Descending Only (Spread: {accuracy["spread"]:.0f}px)', color='white')
+    ax_bottom.legend(facecolor='#1e1e1e', edgecolor='#444', labelcolor='white', loc='best')
+    ax_bottom.grid(True, alpha=0.2, color='white')
+
+    fig_acc.tight_layout()
+    st.pyplot(fig_acc)
+    plt.close(fig_acc)
+
+    # Accuracy summary text
+    num_extrapolated = sum(1 for i in accuracy['intercepts'] if i.get('extrapolated', False))
+    num_actual = len(accuracy['intercepts']) - num_extrapolated
+
+    summary_text = f"**Analysis**: At {target_height_pct}% height ({target_y_px}px from top), shots have a mean position of {accuracy['mean_x']:.0f}px with {accuracy['std_x']:.0f}px spread. "
+    summary_text += f"50% of shots land within {accuracy['cep']:.0f}px of center, 95% within {accuracy['r95']:.0f}px. "
+
+    if num_extrapolated > 0:
+        summary_text += f"({num_actual} actual intercepts, {num_extrapolated} extrapolated)"
+    else:
+        summary_text += f"(All {num_actual} intercepts measured directly)"
+
+    st.caption(summary_text)
+
+# --- End Unified Render Functions ---
+
+if temp_path and not st.session_state.analysis_complete:
+    # PHASE 1: Video Analysis (only run if not already complete)
     cap = cv2.VideoCapture(temp_path)
     
     if not cap.isOpened():
@@ -112,33 +631,16 @@ if temp_path:
         height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         video_fps = cap.get(cv2.CAP_PROP_FPS) if auto_fps else manual_fps
         if video_fps <= 0: video_fps = 30
-        
-        # UI Layout
 
-        col1, col2 = st.columns([1, 1])
-        video_feed = col1.empty()
-        graph_plot = col2.empty()
-
-        pause_btn = st.empty()
-        status_bar = st.empty()
-        summary_area = st.empty()
-        trend_plot = st.empty()
-        log_table = st.empty()
+        # Store video properties for Phase 2 rendering
+        st.session_state.video_width = width
+        st.session_state.video_height = height
+        st.session_state.video_fps = video_fps
 
         lower_yellow = np.array([20, sat_val, 100])
         upper_yellow = np.array([35, 255, 255])
 
         # --- Helper functions (defined once before the processing loop) ---
-
-        def _initial_direction(path):
-            """Return normalised (dx, dy) unit vector from the first few frames, or None."""
-            n = min(4, len(path))
-            if n < 2:
-                return None
-            dx = np.mean([path[i+1][0] - path[i][0] for i in range(n - 1)])
-            dy = np.mean([path[i+1][1] - path[i][1] for i in range(n - 1)])
-            mag = (dx**2 + dy**2) ** 0.5
-            return (dx / mag, dy / mag) if mag > 0 else None
 
         def predict_pos(path):
             if len(path) >= 2:
@@ -187,6 +689,7 @@ if temp_path:
             return ground_bounce or wall_bounce
 
         def finalize(track):
+            """Finalize a track and store in RAW data (Phase 1)"""
             p = track['path']
             n = min(4, len(p))
             init_vel = sum(
@@ -200,108 +703,20 @@ if temp_path:
             else:
                 launch_angle = 0.0
             max_height_px = min(pt[1] for pt in p)
-            st.session_state.all_trajectories.append(track)
-            st.session_state.ball_log.append({
+            # Store in RAW data (never modified)
+            st.session_state.raw_trajectories.append(track)
+            st.session_state.raw_ball_log.append({
                 "Ball #": track['id'],
                 "Launch Time (s)": round(track['start_time'], 2),
                 "Initial Velocity (px/s)": round(init_vel, 1),
                 "Launch Angle (°)": launch_angle,
                 "Max Height (px from top)": max_height_px,
             })
-            # After 2nd ball finalizes, lock zone + launch direction
-            if st.session_state.launch_zone is None and len(st.session_state.launch_zone_origins) < 2:
-                st.session_state.launch_zone_origins.append({
-                    'pos': track['path'][0],
-                    'dir': _initial_direction(track['path']),
-                })
-                if len(st.session_state.launch_zone_origins) == 2:
-                    origins = st.session_state.launch_zone_origins
-                    cy = int(np.mean([o['pos'][1] for o in origins]))
-                    st.session_state.launch_zone = cy
-                    dirs = [o['dir'] for o in origins if o['dir'] is not None]
-                    if dirs:
-                        adx = np.mean([d[0] for d in dirs])
-                        ady = np.mean([d[1] for d in dirs])
-                        mag = (adx**2 + ady**2) ** 0.5
-                        if mag > 0:
-                            st.session_state.launch_direction = (adx / mag, ady / mag)
-
-        def build_seq_map():
-            """Map track['id'] → sequential ball number (sorted by launch time), matching the table."""
-            log_sorted = sorted(st.session_state.ball_log, key=lambda x: x['Launch Time (s)'])
-            return {entry['Ball #']: i + 1 for i, entry in enumerate(log_sorted)}
-
-        def render_trajectory_chart(all_trajs, live_tracks):
-            id_to_seq = build_seq_map()
-            ax.clear()
-            ax.set_xlim(0, width)
-            ax.set_ylim(-height, 0)
-            ax.set_facecolor('#1e1e1e')
-            for track in all_trajs:
-                pts = np.array(track['path'])
-                ax.plot(pts[:, 0], -pts[:, 1], color=track['color'], linewidth=2, alpha=0.85)
-                mid = len(pts) // 2
-                ax.text(pts[mid, 0], -pts[mid, 1],
-                        str(id_to_seq.get(track['id'], track['id'])),
-                        color=track['color'], fontsize=7, ha='center', va='bottom')
-            for track in live_tracks:
-                if len(track['path']) > 1:
-                    pts = np.array(track['path'])
-                    ax.plot(pts[:, 0], -pts[:, 1], color=track['color'], linewidth=4)
-                    mid = len(pts) // 2
-                    ax.text(pts[mid, 0], -pts[mid, 1],
-                            str(id_to_seq.get(track['id'], '…')),
-                            color=track['color'], fontsize=7, ha='center', va='bottom')
-            graph_plot.pyplot(fig)
-
-        def render_summary(df):
-            with summary_area.container():
-                st.markdown(f"### Balls: {len(df)}")
-                stats = pd.DataFrame({
-                    "Metric": ["Velocity (px/s)", "Launch Angle (°)", "Max Height (px from top)"],
-                    "Avg": [
-                        f"{df['Initial Velocity (px/s)'].mean():.0f}",
-                        f"{df['Launch Angle (°)'].mean():.1f}",
-                        f"{df['Max Height (px from top)'].mean():.0f}",
-                    ],
-                    "Std Dev": [
-                        f"{df['Initial Velocity (px/s)'].std():.0f}",
-                        f"{df['Launch Angle (°)'].std():.1f}",
-                        f"{df['Max Height (px from top)'].std():.0f}",
-                    ],
-                })
-                st.dataframe(stats, hide_index=True, use_container_width=True)
-            if len(df) >= 2:
-                fig_trend, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(8, 6), sharex=True)
-                fig_trend.patch.set_facecolor('#1e1e1e')
-                x = df["Ball"]
-                for sub_ax in (ax1, ax2, ax3):
-                    sub_ax.set_facecolor('#1e1e1e')
-                    sub_ax.tick_params(colors='white')
-                    sub_ax.spines[:].set_color('#444')
-                ax1.plot(x, df["Initial Velocity (px/s)"], 'o-', color='#00bfff')
-                ax1.axhline(df["Initial Velocity (px/s)"].mean(), color='#00bfff', linestyle='--', alpha=0.4)
-                ax1.set_ylabel("Init Velocity\n(px/s)", color='white', fontsize=8)
-                ax2.plot(x, df["Launch Angle (°)"], 'o-', color='#ff7f0e')
-                ax2.axhline(df["Launch Angle (°)"].mean(), color='#ff7f0e', linestyle='--', alpha=0.4)
-                ax2.set_ylabel("Launch Angle\n(°)", color='white', fontsize=8)
-                ax3.plot(x, df["Max Height (px from top)"], 'o-', color='#2ecc71')
-                ax3.axhline(df["Max Height (px from top)"].mean(), color='#2ecc71', linestyle='--', alpha=0.4)
-                ax3.set_ylabel("Max Height\n(px from top)", color='white', fontsize=8)
-                ax3.set_xlabel("Ball #", color='white', fontsize=9)
-                ax3.xaxis.set_major_locator(plt.MaxNLocator(integer=True))
-                fig_trend.tight_layout()
-                trend_plot.pyplot(fig_trend)
-                plt.close(fig_trend)
-            log_table.dataframe(df, hide_index=True, use_container_width=True)
 
         # --- End helpers ---
 
         active_tracks = st.session_state.active_tracks if st.session_state.pause_frame > 0 else []
-        fig, ax = plt.subplots(figsize=(6, 5))
-        colormap = cm.get_cmap('gist_rainbow')
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        GRAPH_UPDATE_INTERVAL = 10
 
         # Seek to paused position if resuming
         frame_count = st.session_state.pause_frame
@@ -311,9 +726,20 @@ if temp_path:
         if st.session_state.paused:
             if st.session_state.last_frame is not None:
                 video_feed.image(st.session_state.last_frame)
-            if st.session_state.all_trajectories or st.session_state.active_tracks:
-                render_trajectory_chart(st.session_state.all_trajectories,
-                                        st.session_state.active_tracks)
+            # Use filtered data if analysis complete, otherwise raw data
+            display_trajectories = st.session_state.all_trajectories if st.session_state.analysis_complete else st.session_state.raw_trajectories
+            display_log = st.session_state.ball_log if st.session_state.analysis_complete else st.session_state.raw_ball_log
+            if display_trajectories or st.session_state.active_tracks:
+                render_trajectory_chart_unified(display_trajectories,
+                                        st.session_state.active_tracks,
+                                        display_log,
+                                        width, height, False, 80)
+            if display_log:
+                df = pd.DataFrame(display_log)
+                df = df.sort_values("Launch Time (s)").reset_index(drop=True)
+                df.insert(0, "Ball", range(1, len(df) + 1))
+                # Don't drop Ball # yet - needed for accuracy mapping
+                render_summary_unified(df, None)
             if pause_btn.button("▶ Resume", key="pause_btn"):
                 st.session_state.paused = False
                 st.rerun()
@@ -346,7 +772,7 @@ if temp_path:
             for cnt in contours:
                 area = cv2.contourArea(cnt)
                 perimeter = cv2.arcLength(cnt, True)
-                if area > 100 and perimeter > 0:
+                if area > MIN_BALL_AREA and perimeter > 0:
                     circularity = 4 * np.pi * (area / (perimeter * perimeter))
                     if circularity > sensitivity:
                         M = cv2.moments(cnt)
@@ -355,7 +781,7 @@ if temp_path:
                             current_centers.append(center)
 
             # 2. Tracking & Velocity Calculation
-            max_track_frames = int(video_fps * 3)  # max 3s per ball flight
+            max_track_frames = int(video_fps * MAX_FLIGHT_TIME_SEC)
 
             new_active = []
             for center in current_centers:
@@ -376,32 +802,23 @@ if temp_path:
                     matched = True
 
                 if not matched:
-                    if st.session_state.launch_zone is None:
-                        # Calibration phase: only accept detections in the right third of the
-                        # frame so bounced/stray balls in the middle don't corrupt calibration
-                        in_zone = center[0] >= width * 2 // 3
-                    else:
-                        zy = st.session_state.launch_zone
-                        half_h = launch_zone_height
-                        in_zone = (center[0] >= width * 2 // 3 and
-                                   zy - half_h <= center[1] <= zy + half_h)
-                    if in_zone:
-                        ball_id = st.session_state.next_ball_id
-                        st.session_state.next_ball_id += 1
-                        new_active.append({
-                            'id': ball_id,
-                            'path': [center],
-                            'color': colormap((ball_id * 0.618033988749895) % 1.0),
-                            'missing_count': 0,
-                            'start_time': current_timestamp
-                        })
+                    # Create new track for any unmatched detection
+                    ball_id = st.session_state.next_ball_id
+                    st.session_state.next_ball_id += 1
+                    new_active.append({
+                        'id': ball_id,
+                        'path': [center],
+                        'color': colormap((ball_id * 0.618033988749895) % 1.0),
+                        'missing_count': 0,
+                        'start_time': current_timestamp
+                    })
 
             for track in active_tracks:
                 track['missing_count'] += 1
                 track_age = len(track['path']) + track['missing_count']
                 expired = track_age > max_track_frames
                 lost = track['missing_count'] >= memory_frames
-                if (expired or lost) and len(track['path']) > 4:
+                if (expired or lost) and len(track['path']) > MIN_TRAJECTORY_LENGTH:
                     finalize(track)
                 elif not expired and not lost:
                     new_active.append(track)
@@ -409,48 +826,16 @@ if temp_path:
             # Finalize tracks whose ballistic arc was interrupted by a bounce
             still_flying = []
             for track in new_active:
-                if has_bounced(track['path']) and len(track['path']) > 4:
+                if has_bounced(track['path']) and len(track['path']) > MIN_TRAJECTORY_LENGTH:
                     finalize(track)
                 else:
                     still_flying.append(track)
-
-            # Drop tracks whose initial direction doesn't match the calibrated launch direction
-            if st.session_state.launch_direction is not None:
-                ldx, ldy = st.session_state.launch_direction
-                validated = []
-                for track in still_flying:
-                    if len(track['path']) < 3:
-                        validated.append(track)   # too few points to judge yet — keep
-                        continue
-                    d = _initial_direction(track['path'])
-                    if d is None:
-                        validated.append(track)
-                        continue
-                    cos_a = d[0] * ldx + d[1] * ldy
-                    angle = np.degrees(np.arccos(np.clip(cos_a, -1, 1)))
-                    if angle <= 60:               # within 60° of calibrated direction
-                        validated.append(track)
-                    # else: silently drop — ball is moving the wrong way
-                still_flying = validated
 
             new_active = still_flying
 
             active_tracks = new_active
             st.session_state.active_tracks = active_tracks
             st.session_state.pause_frame = frame_count
-
-            # Draw launch zone box (shown only once it's locked from 2 calibration balls)
-            if st.session_state.launch_zone is not None:
-                zy = st.session_state.launch_zone
-                half_h = launch_zone_height
-                bx1, by1, bx2, by2 = width * 2 // 3, zy - half_h, width, zy + half_h
-                cv2.rectangle(frame, (bx1, by1), (bx2, by2), (0, 200, 255), 2, cv2.LINE_AA)
-                cv2.putText(frame, "launch zone", (max(bx1 - 4, 0), by1 - 8),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 200, 255), 1)
-            else:
-                remaining = 2 - len(st.session_state.launch_zone_origins)
-                cv2.putText(frame, f"calibrating: {remaining} ball(s) to go",
-                            (10, height - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 200, 255), 2)
 
             # Draw tracking boxes with ball numbers
             for track in active_tracks:
@@ -464,7 +849,7 @@ if temp_path:
                             cv2.FONT_HERSHEY_SIMPLEX, 0.7, color_bgr, 2)
 
             # 3. UI Updates
-            finalized_count = len(st.session_state.all_trajectories)
+            finalized_count = len(st.session_state.raw_trajectories)
             cv2.putText(frame, f"Time: {current_timestamp:.2f}s", (50, 50),
                         cv2.FONT_HERSHEY_SIMPLEX, 1.2, (255, 255, 255), 2)
             cv2.putText(frame, f"Balls: {finalized_count}", (50, 100),
@@ -481,17 +866,17 @@ if temp_path:
 
             t_graph_start = time.time()
             if frame_count % GRAPH_UPDATE_INTERVAL == 0:
-                render_trajectory_chart(st.session_state.all_trajectories, active_tracks)
-                if st.session_state.ball_log:
-                    df = pd.DataFrame(st.session_state.ball_log)
+                render_trajectory_chart_unified(st.session_state.raw_trajectories, active_tracks, st.session_state.raw_ball_log, width, height, False, 80)
+                if st.session_state.raw_ball_log:
+                    df = pd.DataFrame(st.session_state.raw_ball_log)
                     df = df.sort_values("Launch Time (s)").reset_index(drop=True)
                     df.insert(0, "Ball", range(1, len(df) + 1))
-                    df = df.drop(columns=["Ball #"])
-                    render_summary(df)
+                    # Don't drop Ball # yet - needed for accuracy mapping
+                    render_summary_unified(df, None)
             t_graph_end = time.time()
 
             t_total = time.time() - t_frame_start
-            print(f"[frame {frame_count:04d}] total={t_total*1000:.1f}ms | cv={( t_cv - t_frame_start)*1000:.1f}ms | video_feed={(t_video - t_cv)*1000:.1f}ms | graph={(t_graph_end - t_graph_start)*1000:.1f}ms | balls={len(st.session_state.all_trajectories)}")
+            print(f"[frame {frame_count:04d}] total={t_total*1000:.1f}ms | cv={( t_cv - t_frame_start)*1000:.1f}ms | video_feed={(t_video - t_cv)*1000:.1f}ms | graph={(t_graph_end - t_graph_start)*1000:.1f}ms | balls={len(st.session_state.raw_trajectories)}")
 
             # Sync Playback
             elapsed = time.time() - start_process_time
@@ -502,20 +887,394 @@ if temp_path:
 
         # Finalize any tracks still in flight when the video ended
         for track in active_tracks:
-            if len(track['path']) > 4:
+            if len(track['path']) > MIN_TRAJECTORY_LENGTH:
                 finalize(track)
         active_tracks = []
         st.session_state.active_tracks = []
 
-        # Final render — trajectory chart + summary/table with all finalized balls
-        render_trajectory_chart(st.session_state.all_trajectories, [])
-        if st.session_state.ball_log:
-            df = pd.DataFrame(st.session_state.ball_log)
-            df = df.sort_values("Launch Time (s)").reset_index(drop=True)
-            df.insert(0, "Ball", range(1, len(df) + 1))
-            df = df.drop(columns=["Ball #"])
-            render_summary(df)
-        plt.close(fig)
+        # Mark analysis as complete
+        st.session_state.analysis_complete = True
 
-        status_bar.empty()
-        st.success(f"Analysis complete — {len(st.session_state.all_trajectories)} balls detected.")
+# PHASE 2: Interactive Filtering Function (callable anytime)
+def apply_filters(raw_trajectories, raw_ball_log, launch_time_pct, enable_stats, stats_sens, min_ang, max_ang, min_vel, min_ht, max_ht):
+    """Apply all filters to raw data and return filtered results."""
+
+    if not raw_trajectories:
+        return [], [], None, None, {}
+
+    filtered_trajs = list(raw_trajectories)
+    filtered_log = list(raw_ball_log)
+    filter_stats = {
+        'initial': len(raw_trajectories),
+        'spatial_removed': 0,
+        'domain_removed': 0,
+        'stats_removed': 0,
+        'spatial_details': [],
+        'domain_details': [],
+        'stats_details': [],
+        'launch_zone_info': {},
+        'iqr_info': {}
+    }
+
+    launch_center = None
+    launch_radius = None
+
+    # Step 1: Spatial filtering (launch zone)
+    if len(filtered_trajs) >= 3:
+        start_positions = np.array([track['path'][0] for track in filtered_trajs])
+        start_times = np.array([track['start_time'] for track in filtered_trajs])
+
+        time_threshold = np.percentile(start_times, launch_time_pct)
+        early_mask = start_times <= time_threshold
+        num_early = np.sum(early_mask)
+
+        if num_early >= 2:
+            early_positions = start_positions[early_mask]
+            launch_center = np.median(early_positions, axis=0)
+            distances_from_center = np.sqrt(np.sum((early_positions - launch_center)**2, axis=1))
+            base_radius = np.median(distances_from_center) if len(distances_from_center) > 1 else distances_from_center[0]
+            launch_radius = max(base_radius * SPATIAL_FILTER_MULTIPLIER, MIN_LAUNCH_ZONE_RADIUS)
+            launch_radius = min(launch_radius, MAX_LAUNCH_ZONE_RADIUS)
+        else:
+            launch_center = np.median(start_positions, axis=0)
+            launch_radius = 100
+
+        distances = np.sqrt(np.sum((start_positions - launch_center)**2, axis=1))
+
+        new_trajs = []
+        new_log = []
+        for i, (track, log) in enumerate(zip(filtered_trajs, filtered_log)):
+            if distances[i] <= launch_radius:
+                new_trajs.append(track)
+                new_log.append(log)
+
+        filter_stats['spatial_removed'] = len(filtered_trajs) - len(new_trajs)
+        filter_stats['launch_zone_info'] = {
+            'center': launch_center,
+            'radius': launch_radius,
+            'time_pct': launch_time_pct,
+            'num_early': num_early
+        }
+        filtered_trajs = new_trajs
+        filtered_log = new_log
+
+    # Step 2: Domain filtering (physically impossible values)
+    if len(filtered_trajs) >= 1:
+        new_trajs = []
+        new_log = []
+        domain_details = []
+
+        for track, log in zip(filtered_trajs, filtered_log):
+            reasons = []
+            angle = log['Launch Angle (°)']
+            velocity = log['Initial Velocity (px/s)']
+            height = log['Max Height (px from top)']
+
+            # Check if trajectory stayed entirely within launch zone (never left)
+            if launch_center is not None and launch_radius is not None:
+                path_points = np.array(track['path'])
+                distances_from_launch = np.sqrt(np.sum((path_points - launch_center)**2, axis=1))
+                max_distance = np.max(distances_from_launch)
+                if max_distance <= launch_radius * 1.2:  # Allow 20% buffer
+                    reasons.append(f"Never left launch zone (max dist: {max_distance:.0f}px vs zone: {launch_radius:.0f}px)")
+
+            if angle < min_ang or angle > max_ang:
+                reasons.append(f"Angle: {angle:.1f}° (range: {min_ang}-{max_ang}°)")
+            if velocity < min_vel:
+                reasons.append(f"Velocity: {velocity:.1f} px/s (min: {min_vel})")
+            if height < min_ht or height > max_ht:
+                reasons.append(f"Height: {height} px (range: {min_ht}-{max_ht})")
+            if len(track['path']) < MIN_TRAJECTORY_LENGTH:
+                reasons.append(f"Length: {len(track['path'])} pts (min: {MIN_TRAJECTORY_LENGTH})")
+
+            if len(reasons) == 0:
+                new_trajs.append(track)
+                new_log.append(log)
+            else:
+                domain_details.append({
+                    'ball_id': log['Ball #'],
+                    'reasons': reasons
+                })
+
+        filter_stats['domain_removed'] = len(filtered_trajs) - len(new_trajs)
+        filter_stats['domain_details'] = domain_details
+        filtered_trajs = new_trajs
+        filtered_log = new_log
+
+    # Step 3: Statistical filtering (IQR method)
+    if enable_stats and len(filtered_log) >= 5:
+        df_stats = pd.DataFrame(filtered_log)
+        metrics = ['Initial Velocity (px/s)', 'Launch Angle (°)', 'Max Height (px from top)']
+        outlier_mask = np.zeros(len(df_stats), dtype=bool)
+        outlier_reasons = [[] for _ in range(len(df_stats))]
+
+        for metric in metrics:
+            values = df_stats[metric].values
+            q1 = np.percentile(values, 25)
+            q3 = np.percentile(values, 75)
+            iqr = q3 - q1
+            lower_bound = q1 - stats_sens * iqr
+            upper_bound = q3 + stats_sens * iqr
+            is_outlier = (values < lower_bound) | (values > upper_bound)
+            outlier_mask |= is_outlier
+
+            # Store IQR info for debugging
+            filter_stats['iqr_info'][metric] = {
+                'q1': q1,
+                'q3': q3,
+                'iqr': iqr,
+                'lower': lower_bound,
+                'upper': upper_bound,
+                'outliers_count': np.sum(is_outlier),
+                'min_value': np.min(values),
+                'max_value': np.max(values)
+            }
+
+            for i, out in enumerate(is_outlier):
+                if out:
+                    outlier_reasons[i].append(f"{metric}: {values[i]:.1f} ({lower_bound:.1f}-{upper_bound:.1f})")
+
+        valid_indices = ~outlier_mask
+        new_trajs = []
+        new_log = []
+        stats_details = []
+
+        for i, (track, log) in enumerate(zip(filtered_trajs, filtered_log)):
+            if valid_indices[i]:
+                new_trajs.append(track)
+                new_log.append(log)
+            else:
+                stats_details.append({
+                    'ball_id': log['Ball #'],
+                    'reasons': outlier_reasons[i]
+                })
+
+        filter_stats['stats_removed'] = len(filtered_trajs) - len(new_trajs)
+        filter_stats['stats_details'] = stats_details
+        filtered_trajs = new_trajs
+        filtered_log = new_log
+
+    return filtered_trajs, filtered_log, launch_center, launch_radius, filter_stats
+
+# Apply filtering after video analysis OR when sliders change
+if st.session_state.analysis_complete and st.session_state.raw_trajectories:
+    # PHASE 2: Apply interactive filters
+    # Debug: show filter parameters
+    with st.sidebar.expander("🔧 Active Filter Settings", expanded=False):
+        st.caption(f"**Launch Zone:** Earliest {launch_time_percentile}%")
+        st.caption(f"**Domain Angle:** {min_angle}° to {max_angle}°")
+        st.caption(f"**Domain Height:** {min_height} to {max_height} px")
+        st.caption(f"**Domain Velocity:** ≥{min_velocity} px/s")
+        st.caption(f"**Stats Filtering:** {'Enabled' if enable_stats_filtering else 'Disabled'}")
+        if enable_stats_filtering:
+            st.caption(f"**Stats Threshold:** {stats_sensitivity}")
+
+    filtered_trajectories, filtered_log, launch_center, launch_radius, filter_stats = apply_filters(
+        st.session_state.raw_trajectories,
+        st.session_state.raw_ball_log,
+        launch_time_percentile,
+        enable_stats_filtering,
+        stats_sensitivity,
+        min_angle,
+        max_angle,
+        min_velocity,
+        min_height,
+        max_height
+    )
+
+    # Update session state with filtered results
+    st.session_state.all_trajectories = filtered_trajectories
+    st.session_state.ball_log = filtered_log
+    st.session_state.launch_zone_center = launch_center
+    st.session_state.launch_zone_radius = launch_radius
+
+    # Display filtering results with detailed breakdown
+    total_removed = filter_stats['spatial_removed'] + filter_stats['domain_removed'] + filter_stats['stats_removed']
+
+    # Debug: Show what's happening with stats filtering
+    with st.sidebar.expander("🔍 Debug: Stats Filter Status", expanded=False):
+        balls_before_stats = len(st.session_state.raw_trajectories) - filter_stats['spatial_removed'] - filter_stats['domain_removed']
+        st.caption(f"**Balls before stats filter:** {balls_before_stats}")
+        st.caption(f"**Stats filtering enabled:** {enable_stats_filtering}")
+        st.caption(f"**Stats threshold:** {stats_sensitivity}")
+        st.caption(f"**Balls removed by stats:** {filter_stats['stats_removed']}")
+
+        if balls_before_stats < 5:
+            st.warning(f"⚠️ Need 5+ balls for stats filtering (have {balls_before_stats})")
+
+        # Show IQR details if available
+        if 'iqr_info' in filter_stats and filter_stats['iqr_info']:
+            st.divider()
+            st.caption("**IQR Analysis:**")
+            for metric, info in filter_stats['iqr_info'].items():
+                metric_short = metric.split('(')[0].strip()
+                st.caption(f"**{metric_short}:**")
+                st.caption(f"  Range: {info['min_value']:.1f} - {info['max_value']:.1f}")
+                st.caption(f"  IQR: {info['iqr']:.1f} (Q1={info['q1']:.1f}, Q3={info['q3']:.1f})")
+                st.caption(f"  Bounds: {info['lower']:.1f} - {info['upper']:.1f}")
+                st.caption(f"  Outliers: {info['outliers_count']}")
+                if info['iqr'] < 1:
+                    st.warning(f"⚠️ Very small IQR - data is too consistent!")
+        else:
+            st.caption("(No IQR data - stats filter didn't run)")
+
+    with st.expander(f"📊 Filtering Summary: {filter_stats['initial']} detected → {len(filtered_trajectories)} valid ({total_removed} removed)", expanded=total_removed > 0):
+        col_a, col_b, col_c = st.columns(3)
+
+        with col_a:
+            st.metric("Spatial Filter", f"{filter_stats['spatial_removed']} removed",
+                     delta=f"{len(filtered_trajectories) + filter_stats['domain_removed'] + filter_stats['stats_removed']} kept",
+                     delta_color="off")
+            if filter_stats['launch_zone_info']:
+                lz_info = filter_stats['launch_zone_info']
+                st.caption(f"Zone: ({int(lz_info['center'][0])}, {int(lz_info['center'][1])}) ±{int(lz_info['radius'])}px")
+                st.caption(f"Using earliest {lz_info['time_pct']}% ({lz_info['num_early']} balls)")
+
+        with col_b:
+            st.metric("Domain Filter", f"{filter_stats['domain_removed']} removed",
+                     delta=f"{len(filtered_trajectories) + filter_stats['stats_removed']} kept",
+                     delta_color="off")
+            if filter_stats['domain_details']:
+                for detail in filter_stats['domain_details'][:3]:  # Show first 3
+                    st.caption(f"Ball #{detail['ball_id']}: {', '.join(detail['reasons'])}")
+                if len(filter_stats['domain_details']) > 3:
+                    st.caption(f"... and {len(filter_stats['domain_details']) - 3} more")
+
+        with col_c:
+            st.metric("Statistical Filter", f"{filter_stats['stats_removed']} removed",
+                     delta=f"{len(filtered_trajectories)} final",
+                     delta_color="off")
+            if filter_stats['stats_details']:
+                for detail in filter_stats['stats_details'][:3]:  # Show first 3
+                    st.caption(f"Ball #{detail['ball_id']}: {'; '.join(detail['reasons'][:2])}")
+                if len(filter_stats['stats_details']) > 3:
+                    st.caption(f"... and {len(filter_stats['stats_details']) - 3} more")
+
+    # Draw launch zone on video frame
+    if launch_center is not None and st.session_state.last_frame is not None:
+        frame_with_zone = cv2.cvtColor(st.session_state.last_frame, cv2.COLOR_RGB2BGR)
+        center_x, center_y = int(launch_center[0]), int(launch_center[1])
+        radius = int(launch_radius)
+        cv2.circle(frame_with_zone, (center_x, center_y), radius, (0, 255, 255), 2, cv2.LINE_AA)
+        cv2.circle(frame_with_zone, (center_x, center_y), 5, (0, 255, 255), -1)
+        cv2.putText(frame_with_zone, "Launch Zone", (center_x - 50, center_y - radius - 10),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+        display_frame = cv2.cvtColor(frame_with_zone, cv2.COLOR_BGR2RGB)
+    else:
+        display_frame = st.session_state.last_frame
+
+# Show results if analysis is complete
+if st.session_state.analysis_complete and st.session_state.raw_trajectories:
+    # Display video frame with launch zone
+    if st.session_state.last_frame is not None:
+        if 'display_frame' in locals():
+            video_feed.image(display_frame)
+        else:
+            video_feed.image(st.session_state.last_frame)
+
+    # Render chart and summary
+    if st.session_state.all_trajectories:
+        # Get video dimensions from session state
+        width = st.session_state.get('video_width', 1920)
+        height = st.session_state.get('video_height', 1080)
+
+        # Calculate accuracy data first (if enabled) so we can add columns to table
+        accuracy_data = None
+        if enable_accuracy and len(st.session_state.all_trajectories) >= 3:
+            target_y_px = int(height * target_height_pct / 100)
+            accuracy_data = calculate_target_accuracy(
+                st.session_state.all_trajectories,
+                st.session_state.ball_log,
+                target_y_px,
+                height
+            )
+
+        render_trajectory_chart_unified(st.session_state.all_trajectories, [], st.session_state.ball_log, width, height, enable_accuracy, target_height_pct if enable_accuracy else 80)
+
+        df = pd.DataFrame(st.session_state.ball_log)
+        df = df.sort_values("Launch Time (s)").reset_index(drop=True)
+        df.insert(0, "Ball", range(1, len(df) + 1))
+        # Keep Ball # for now (needed for accuracy mapping), will be dropped by render_summary_unified
+        render_summary_unified(df, accuracy_data)
+
+        # Target accuracy visualization
+        if enable_accuracy and accuracy_data is not None:
+            render_accuracy_analysis(
+                accuracy_data,
+                st.session_state.all_trajectories,
+                target_height_pct,
+                width,
+                height
+            )
+
+        # Summary and save button
+        initial_count = len(st.session_state.raw_trajectories)
+        final_count = len(st.session_state.all_trajectories)
+        removed_count = initial_count - final_count
+
+        col_status, col_save = st.columns([3, 1])
+        with col_status:
+            if removed_count > 0:
+                st.success(f"✅ Analysis complete — **{final_count} valid balls** (removed {removed_count} outliers from {initial_count} detected)")
+            else:
+                st.success(f"✅ Analysis complete — **{final_count} balls** detected")
+
+        # Save button - only save when user clicks
+        with col_save:
+            if st.button("💾 Save Results", use_container_width=True):
+                try:
+                    video_dir = os.path.dirname(os.path.abspath(st.session_state.video_path))
+                    timestamp = time.strftime("%Y%m%d_%H%M%S")
+
+                    # Prepare dataframe for saving (with accuracy data if available)
+                    save_df = df.copy()
+                    if accuracy_data is not None and 'intercept_map' in accuracy_data:
+                        target_distances = []
+                        target_positions = []
+                        extrapolated_flags = []
+
+                        for _, row in save_df.iterrows():
+                            ball_id = row.get('Ball #', None)
+                            if ball_id and ball_id in accuracy_data['intercept_map']:
+                                info = accuracy_data['intercept_map'][ball_id]
+                                target_distances.append(round(info['target_distance'], 1))
+                                target_positions.append(round(info['target_x'], 1))
+                                extrapolated_flags.append('Yes' if info['extrapolated'] else 'No')
+                            else:
+                                target_distances.append(None)
+                                target_positions.append(None)
+                                extrapolated_flags.append('N/A')
+
+                        save_df['Target X (px)'] = target_positions
+                        save_df['Target Distance (px)'] = target_distances
+                        save_df['Extrapolated'] = extrapolated_flags
+
+                    # Drop Ball # column (internal ID)
+                    if 'Ball #' in save_df.columns:
+                        save_df = save_df.drop(columns=['Ball #'])
+
+                    # Create filenames with filter settings for clarity
+                    filter_desc = f"lz{launch_time_percentile}_angle{min_angle}to{max_angle}_vel{min_velocity}"
+                    csv_path = os.path.join(video_dir, f"ball_analysis_{filter_desc}_{timestamp}.csv")
+                    save_df.to_csv(csv_path, index=False)
+
+                    # Save trajectory chart (the current filtered view)
+                    chart_path = os.path.join(video_dir, f"trajectory_chart_{filter_desc}_{timestamp}.jpg")
+                    fig.savefig(chart_path, dpi=150, bbox_inches='tight', facecolor='#1e1e1e')
+
+                    st.session_state.files_saved = True
+                    st.session_state.saved_csv = csv_path
+                    st.session_state.saved_chart = chart_path
+                    st.success(f"✅ Saved!\n\n📊 Chart: `{chart_path}`\n\n📄 Data: `{csv_path}`")
+                except Exception as e:
+                    st.error(f"❌ Error saving files: {str(e)}")
+                st.rerun()
+
+        # Show last saved files info
+        if st.session_state.files_saved:
+            st.info(f"Last saved:\n\n📊 Chart: `{st.session_state.saved_chart}`\n\n📄 Data: `{st.session_state.saved_csv}`")
+
+        # DO NOT close the global fig - it's reused across reruns
+        # plt.close(fig)  # REMOVED - would break subsequent reruns
+    else:
+        st.warning("No valid trajectories after filtering. Try adjusting filter settings.")
