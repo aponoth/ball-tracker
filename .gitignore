@@ -4,6 +4,7 @@ temp_video.*
 # Generated analysis outputs
 ball_analysis_*.csv
 trajectory_chart_*.jpg
+ball_report_*.pdf
 
 # Python
 __pycache__/

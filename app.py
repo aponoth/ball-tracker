@@ -3,6 +3,7 @@ import numpy as np
 import streamlit as st
 import matplotlib.pyplot as plt
 import matplotlib.cm as cm
+from matplotlib.backends.backend_pdf import PdfPages
 import time
 import pandas as pd
 import os
@@ -55,7 +56,7 @@ st.sidebar.caption(f"Minimum: {min_velocity} px/s")
 
 st.sidebar.markdown("**🎯 Target Accuracy**")
 enable_accuracy = st.sidebar.checkbox("Show Accuracy Analysis", value=True)
-target_height_pct = st.sidebar.slider("Target Height (%)", 0, 100, 80, 5) if enable_accuracy else 80
+target_height_pct = st.sidebar.slider("Target Height (%)", 0, 100, 40, 5) if enable_accuracy else 40
 if enable_accuracy:
     st.sidebar.caption(f"Landing accuracy at {target_height_pct}% height (descending only)")
 
@@ -106,6 +107,8 @@ if 'saved_csv' not in st.session_state:
     st.session_state.saved_csv = None
 if 'saved_chart' not in st.session_state:
     st.session_state.saved_chart = None
+if 'saved_pdf' not in st.session_state:
+    st.session_state.saved_pdf = None
 if 'video_width' not in st.session_state:
     st.session_state.video_width = 1920
 if 'video_height' not in st.session_state:
@@ -129,6 +132,7 @@ if st.sidebar.button("Reset All Data"):
     st.session_state.files_saved = False
     st.session_state.saved_csv = None
     st.session_state.saved_chart = None
+    st.session_state.saved_pdf = None
     st.rerun()
 
 
@@ -154,6 +158,7 @@ with col_rerun_btn:
         st.session_state.files_saved = False
         st.session_state.saved_csv = None
         st.session_state.saved_chart = None
+        st.session_state.saved_pdf = None
         st.rerun()
 
 if uploaded_file:
@@ -196,7 +201,7 @@ colormap = cm.get_cmap('gist_rainbow')
 
 # --- Unified Render Functions (module level, available to both phases) ---
 
-def render_trajectory_chart_unified(all_trajs, live_tracks, ball_log, width_dim, height_dim, show_target=False, target_height_pct=80):
+def render_trajectory_chart_unified(all_trajs, live_tracks, ball_log, width_dim, height_dim, show_target=False, target_height_pct=40):
     """Unified trajectory chart renderer for both phases."""
     def build_seq_map(ball_log):
         if not ball_log:
@@ -403,6 +408,8 @@ def calculate_target_accuracy(trajectories, ball_log, target_y_px, frame_height)
         ball_num = ball_id_to_seq.get(track['id'], '?')
 
         # Find peak (highest point = minimum Y value)
+        if len(path) < 2:
+            continue  # Skip invalid trajectories
         y_values = [pt[1] for pt in path]
         peak_idx = y_values.index(min(y_values))
 
@@ -492,7 +499,229 @@ def calculate_target_accuracy(trajectories, ball_log, target_y_px, frame_height)
         'intercept_map': intercept_map
     }
 
-def render_accuracy_analysis(accuracy_data, trajectories, target_height_pct, frame_width, frame_height):
+def generate_pdf_report(trajectories, ball_log, accuracy_data, filter_stats, width, height, target_height_pct, output_path):
+    """Generate comprehensive PDF report with all visualizations and statistics."""
+    with PdfPages(output_path) as pdf:
+        # Page 1: Trajectory Chart
+        fig_traj = plt.figure(figsize=(11, 8.5))
+        ax_traj = fig_traj.add_subplot(111)
+        ax_traj.set_facecolor('#1e1e1e')
+        fig_traj.patch.set_facecolor('#1e1e1e')
+
+        # Build sequence map
+        sorted_log = sorted(ball_log, key=lambda x: x['Launch Time (s)'])
+        ball_id_to_seq = {entry['Ball #']: i + 1 for i, entry in enumerate(sorted_log)}
+
+        # Draw trajectories
+        for track in trajectories:
+            pts = np.array(track['path'])
+            ax_traj.plot(pts[:, 0], -pts[:, 1], color=track['color'], linewidth=1.5, alpha=0.9)
+            end_idx = -1
+            ax_traj.text(pts[end_idx, 0], -pts[end_idx, 1],
+                        str(ball_id_to_seq.get(track['id'], track['id'])),
+                        color=track['color'], fontsize=11, fontweight='bold',
+                        ha='center', va='center')
+
+        # Draw launch zone
+        if filter_stats.get('launch_zone_info'):
+            lz = filter_stats['launch_zone_info']
+            circle = plt.Circle((lz['center'][0], -lz['center'][1]), lz['radius'],
+                               color='cyan', fill=False, linewidth=2, linestyle='--', alpha=0.8)
+            ax_traj.add_patch(circle)
+            ax_traj.plot(lz['center'][0], -lz['center'][1], 'x', color='cyan', markersize=12, markeredgewidth=2)
+
+        ax_traj.autoscale(enable=True, axis='both', tight=False)
+        ax_traj.margins(0.05)
+        ax_traj.set_xlabel('X Position (px)', color='white', fontsize=12)
+        ax_traj.set_ylabel('Y Position (px)', color='white', fontsize=12)
+        ax_traj.set_title('Ball Trajectories', color='white', fontsize=14, fontweight='bold')
+        ax_traj.tick_params(colors='white')
+        for spine in ax_traj.spines.values():
+            spine.set_color('#444')
+        ax_traj.grid(True, alpha=0.3, color='white')
+        pdf.savefig(fig_traj, facecolor='#1e1e1e')
+        plt.close(fig_traj)
+
+        # Page 2: Summary Statistics and Distributions
+        fig_stats = plt.figure(figsize=(11, 8.5))
+        fig_stats.patch.set_facecolor('#1e1e1e')
+
+        # Summary text
+        ax_summary = fig_stats.add_subplot(4, 1, 1)
+        ax_summary.axis('off')
+        df = pd.DataFrame(ball_log)
+        df = df.sort_values("Launch Time (s)").reset_index(drop=True)
+
+        summary_text = f"Ball Tracking Analysis Report\n\n"
+        summary_text += f"Total Balls Analyzed: {len(df)}\n"
+        summary_text += f"Initial Detections: {filter_stats['initial']}\n"
+        summary_text += f"Filtered Out: {filter_stats['spatial_removed']} spatial, "
+        summary_text += f"{filter_stats['domain_removed']} domain, "
+        summary_text += f"{filter_stats['stats_removed']} statistical\n\n"
+        summary_text += f"Velocity: {df['Initial Velocity (px/s)'].mean():.0f} ± {df['Initial Velocity (px/s)'].std():.0f} px/s\n"
+        summary_text += f"Launch Angle: {df['Launch Angle (°)'].mean():.1f} ± {df['Launch Angle (°)'].std():.1f}°\n"
+        summary_text += f"Max Height: {df['Max Height (px from top)'].mean():.0f} ± {df['Max Height (px from top)'].std():.0f} px"
+
+        ax_summary.text(0.05, 0.5, summary_text, fontsize=12, color='white',
+                       verticalalignment='center', family='monospace')
+
+        # Angle distribution
+        ax_angle = fig_stats.add_subplot(4, 1, 2)
+        ax_angle.set_facecolor('#1e1e1e')
+        angles = df['Launch Angle (°)']
+        ax_angle.hist(angles, bins=min(20, len(df)), color='#ff7f0e', alpha=0.7, edgecolor='white')
+        ax_angle.axvline(angles.mean(), color='red', linestyle='--', linewidth=2)
+        ax_angle.set_xlabel('Launch Angle (°)', color='white')
+        ax_angle.set_ylabel('Count', color='white')
+        ax_angle.set_title('Launch Angle Distribution', color='white', fontweight='bold')
+        ax_angle.tick_params(colors='white')
+        for spine in ax_angle.spines.values():
+            spine.set_color('#444')
+
+        # Height distribution
+        ax_height = fig_stats.add_subplot(4, 1, 3)
+        ax_height.set_facecolor('#1e1e1e')
+        heights = df['Max Height (px from top)']
+        ax_height.hist(heights, bins=min(20, len(df)), color='#2ecc71', alpha=0.7, edgecolor='white')
+        ax_height.axvline(heights.mean(), color='red', linestyle='--', linewidth=2)
+        ax_height.set_xlabel('Max Height (px)', color='white')
+        ax_height.set_ylabel('Count', color='white')
+        ax_height.set_title('Max Height Distribution', color='white', fontweight='bold')
+        ax_height.tick_params(colors='white')
+        for spine in ax_height.spines.values():
+            spine.set_color('#444')
+
+        # Velocity distribution
+        ax_vel = fig_stats.add_subplot(4, 1, 4)
+        ax_vel.set_facecolor('#1e1e1e')
+        vels = df['Initial Velocity (px/s)']
+        ax_vel.hist(vels, bins=min(20, len(df)), color='#00bfff', alpha=0.7, edgecolor='white')
+        ax_vel.axvline(vels.mean(), color='red', linestyle='--', linewidth=2)
+        ax_vel.set_xlabel('Initial Velocity (px/s)', color='white')
+        ax_vel.set_ylabel('Count', color='white')
+        ax_vel.set_title('Velocity Distribution', color='white', fontweight='bold')
+        ax_vel.tick_params(colors='white')
+        for spine in ax_vel.spines.values():
+            spine.set_color('#444')
+
+        fig_stats.tight_layout()
+        pdf.savefig(fig_stats, facecolor='#1e1e1e')
+        plt.close(fig_stats)
+
+        # Page 3: Trend Charts
+        if len(df) >= 2:
+            fig_trend = plt.figure(figsize=(11, 8.5))
+            fig_trend.patch.set_facecolor('#1e1e1e')
+
+            x = df["Launch Time (s)"]
+
+            ax1 = fig_trend.add_subplot(3, 1, 1)
+            ax1.set_facecolor('#1e1e1e')
+            ax1.plot(x, df["Initial Velocity (px/s)"], 'o-', color='#00bfff', linewidth=2, markersize=6)
+            ax1.axhline(df["Initial Velocity (px/s)"].mean(), color='#00bfff', linestyle='--', alpha=0.4, linewidth=2)
+            ax1.set_ylabel("Velocity (px/s)", color='white', fontsize=11)
+            ax1.tick_params(colors='white')
+            ax1.set_title('Performance Trends Over Time', color='white', fontsize=14, fontweight='bold')
+            for spine in ax1.spines.values():
+                spine.set_color('#444')
+            ax1.grid(True, alpha=0.3, color='white')
+
+            ax2 = fig_trend.add_subplot(3, 1, 2)
+            ax2.set_facecolor('#1e1e1e')
+            ax2.plot(x, df["Launch Angle (°)"], 'o-', color='#ff7f0e', linewidth=2, markersize=6)
+            ax2.axhline(df["Launch Angle (°)"].mean(), color='#ff7f0e', linestyle='--', alpha=0.4, linewidth=2)
+            ax2.set_ylabel("Angle (°)", color='white', fontsize=11)
+            ax2.tick_params(colors='white')
+            for spine in ax2.spines.values():
+                spine.set_color('#444')
+            ax2.grid(True, alpha=0.3, color='white')
+
+            ax3 = fig_trend.add_subplot(3, 1, 3)
+            ax3.set_facecolor('#1e1e1e')
+            ax3.plot(x, df["Max Height (px from top)"], 'o-', color='#2ecc71', linewidth=2, markersize=6)
+            ax3.axhline(df["Max Height (px from top)"].mean(), color='#2ecc71', linestyle='--', alpha=0.4, linewidth=2)
+            ax3.set_ylabel("Height (px)", color='white', fontsize=11)
+            ax3.set_xlabel("Time (s)", color='white', fontsize=11)
+            ax3.tick_params(colors='white')
+            for spine in ax3.spines.values():
+                spine.set_color('#444')
+            ax3.grid(True, alpha=0.3, color='white')
+
+            fig_trend.tight_layout()
+            pdf.savefig(fig_trend, facecolor='#1e1e1e')
+            plt.close(fig_trend)
+
+        # Page 4: Target Accuracy (if available)
+        if accuracy_data is not None:
+            fig_acc = plt.figure(figsize=(11, 8.5))
+            fig_acc.patch.set_facecolor('#1e1e1e')
+
+            # Top: Trajectories with target line
+            ax_top = fig_acc.add_subplot(2, 1, 1)
+            ax_top.set_facecolor('#1e1e1e')
+
+            for track in trajectories:
+                pts = np.array(track['path'])
+                ax_top.plot(pts[:, 0], pts[:, 1], color=track['color'], linewidth=1, alpha=0.6)
+
+            target_y_px = int(height * target_height_pct / 100)
+            ax_top.axhline(target_y_px, color='red', linestyle='--', linewidth=2, label=f'Target @ {target_height_pct}%')
+
+            # Mark intercepts
+            for intercept in accuracy_data['intercepts']:
+                if intercept.get('extrapolated', False):
+                    ax_top.plot(intercept['x'], intercept['y'], 'o', color='none', markersize=10,
+                               markeredgecolor='orange', markeredgewidth=2)
+                else:
+                    ax_top.plot(intercept['x'], intercept['y'], 'o', color='yellow', markersize=8,
+                               markeredgecolor='red', markeredgewidth=2)
+
+            # Autoscale x-axis to zoom into trajectory region
+            ax_top.autoscale(enable=True, axis='x', tight=False)
+            ax_top.margins(x=0.1, y=0)  # 10% padding on x-axis
+            ax_top.set_ylim(height, 0)  # Keep full Y range
+            ax_top.set_xlabel('X Position (px)', color='white', fontsize=11)
+            ax_top.set_ylabel('Y Position (px)', color='white', fontsize=11)
+            ax_top.set_title(f'Target Accuracy Analysis - {target_height_pct}% Height', color='white', fontsize=14, fontweight='bold')
+            ax_top.tick_params(colors='white')
+            for spine in ax_top.spines.values():
+                spine.set_color('#444')
+            ax_top.grid(True, alpha=0.3, color='white')
+            ax_top.legend(facecolor='#1e1e1e', edgecolor='#444', labelcolor='white')
+
+            # Bottom: Accuracy metrics and scatter
+            ax_bottom = fig_acc.add_subplot(2, 1, 2)
+            ax_bottom.set_facecolor('#1e1e1e')
+
+            x_positions = [i['x'] for i in accuracy_data['intercepts']]
+            times = [i['launch_time'] for i in accuracy_data['intercepts']]
+
+            ax_bottom.scatter(times, x_positions, c='cyan', s=100, alpha=0.8, edgecolors='white')
+            ax_bottom.axhline(accuracy_data['mean_x'], color='green', linestyle='-', linewidth=2)
+            ax_bottom.axhline(accuracy_data['mean_x'] + accuracy_data['std_x'], color='yellow', linestyle='--', alpha=0.6)
+            ax_bottom.axhline(accuracy_data['mean_x'] - accuracy_data['std_x'], color='yellow', linestyle='--', alpha=0.6)
+
+            ax_bottom.set_xlabel('Launch Time (s)', color='white', fontsize=11)
+            ax_bottom.set_ylabel('X Position at Target (px)', color='white', fontsize=11)
+            ax_bottom.set_title(f'Accuracy: Mean={accuracy_data["mean_x"]:.0f}px, Spread={accuracy_data["std_x"]:.0f}px, CEP={accuracy_data["cep"]:.0f}px',
+                               color='white', fontsize=12)
+            ax_bottom.tick_params(colors='white')
+            for spine in ax_bottom.spines.values():
+                spine.set_color('#444')
+            ax_bottom.grid(True, alpha=0.3, color='white')
+
+            fig_acc.tight_layout()
+            pdf.savefig(fig_acc, facecolor='#1e1e1e')
+            plt.close(fig_acc)
+
+        # PDF metadata
+        d = pdf.infodict()
+        d['Title'] = 'Ball Tracking Analysis Report'
+        d['Author'] = 'Ball Tracker Dashboard'
+        d['Subject'] = 'Trajectory Analysis and Accuracy Metrics'
+        d['CreationDate'] = time.strftime('%Y%m%d%H%M%S')
+
+def render_accuracy_analysis(accuracy_data, trajectories, ball_log, target_height_pct, frame_width, frame_height):
     """Render target accuracy visualization using pre-calculated accuracy data."""
     if accuracy_data is None:
         target_y_px = int(frame_height * target_height_pct / 100)
@@ -551,8 +780,10 @@ def render_accuracy_analysis(accuracy_data, trajectories, target_height_pct, fra
                        markeredgecolor='red', markeredgewidth=2, label=label)
             actual_labeled = True
 
-    ax_top.set_xlim(0, frame_width)
-    ax_top.set_ylim(frame_height, 0)  # Invert Y axis (normal image coordinates)
+    # Autoscale x-axis to zoom into trajectory region, keep full y-axis for context
+    ax_top.autoscale(enable=True, axis='x', tight=False)
+    ax_top.margins(x=0.1, y=0)  # 10% padding on x-axis, no padding on y
+    ax_top.set_ylim(frame_height, 0)  # Keep full Y range (normal image coordinates)
     ax_top.set_xlabel('X Position (px)', color='white')
     ax_top.set_ylabel('Y Position (px)', color='white')
     ax_top.set_title('Trajectories with Target Line (X = apex, circles = descending intercept)', color='white', fontsize=9)
@@ -617,6 +848,48 @@ def render_accuracy_analysis(accuracy_data, trajectories, target_height_pct, fra
         summary_text += f"(All {num_actual} intercepts measured directly)"
 
     st.caption(summary_text)
+
+    # Correlation analysis
+    if len(accuracy['intercepts']) >= 3:
+        st.markdown("#### 📊 Correlation Analysis")
+
+        # Build correlation dataframe
+        corr_data = []
+        for intercept in accuracy['intercepts']:
+            ball_id = intercept['ball_id']
+            # Find corresponding log entry
+            for log_entry in ball_log:
+                if log_entry['Ball #'] == ball_id:
+                    corr_data.append({
+                        'Target X': intercept['x'],
+                        'Velocity': log_entry['Initial Velocity (px/s)'],
+                        'Angle': log_entry['Launch Angle (°)'],
+                        'Max Height': log_entry['Max Height (px from top)'],
+                        'Launch Time': log_entry['Launch Time (s)']
+                    })
+                    break
+
+        if corr_data:
+            corr_df = pd.DataFrame(corr_data)
+            correlations = corr_df.corr()['Target X'].drop('Target X').sort_values(ascending=False)
+
+            st.caption("**Correlation with Target X (landing position):**")
+            col_corr1, col_corr2, col_corr3, col_corr4 = st.columns(4)
+
+            with col_corr1:
+                val = correlations.get('Velocity', 0)
+                st.metric("Velocity", f"{val:.3f}", help="Positive = higher velocity → lands further right")
+            with col_corr2:
+                val = correlations.get('Angle', 0)
+                st.metric("Launch Angle", f"{val:.3f}", help="Positive = steeper angle → lands further right")
+            with col_corr3:
+                val = correlations.get('Max Height', 0)
+                st.metric("Max Height", f"{val:.3f}", help="Positive = higher peak → lands further right")
+            with col_corr4:
+                val = correlations.get('Launch Time', 0)
+                st.metric("Launch Time", f"{val:.3f}", help="Positive = later shots → lands further right")
+
+            st.caption("*Correlation ranges from -1 (strong negative) to +1 (strong positive). Values near 0 indicate weak correlation.*")
 
 # --- End Unified Render Functions ---
 
@@ -733,7 +1006,7 @@ if temp_path and not st.session_state.analysis_complete:
                 render_trajectory_chart_unified(display_trajectories,
                                         st.session_state.active_tracks,
                                         display_log,
-                                        width, height, False, 80)
+                                        width, height, False, 40)
             if display_log:
                 df = pd.DataFrame(display_log)
                 df = df.sort_values("Launch Time (s)").reset_index(drop=True)
@@ -866,7 +1139,7 @@ if temp_path and not st.session_state.analysis_complete:
 
             t_graph_start = time.time()
             if frame_count % GRAPH_UPDATE_INTERVAL == 0:
-                render_trajectory_chart_unified(st.session_state.raw_trajectories, active_tracks, st.session_state.raw_ball_log, width, height, False, 80)
+                render_trajectory_chart_unified(st.session_state.raw_trajectories, active_tracks, st.session_state.raw_ball_log, width, height, False, 40)
                 if st.session_state.raw_ball_log:
                     df = pd.DataFrame(st.session_state.raw_ball_log)
                     df = df.sort_values("Launch Time (s)").reset_index(drop=True)
@@ -1189,7 +1462,7 @@ if st.session_state.analysis_complete and st.session_state.raw_trajectories:
                 height
             )
 
-        render_trajectory_chart_unified(st.session_state.all_trajectories, [], st.session_state.ball_log, width, height, enable_accuracy, target_height_pct if enable_accuracy else 80)
+        render_trajectory_chart_unified(st.session_state.all_trajectories, [], st.session_state.ball_log, width, height, enable_accuracy, target_height_pct if enable_accuracy else 40)
 
         df = pd.DataFrame(st.session_state.ball_log)
         df = df.sort_values("Launch Time (s)").reset_index(drop=True)
@@ -1202,26 +1475,27 @@ if st.session_state.analysis_complete and st.session_state.raw_trajectories:
             render_accuracy_analysis(
                 accuracy_data,
                 st.session_state.all_trajectories,
+                st.session_state.ball_log,
                 target_height_pct,
                 width,
                 height
             )
 
-        # Summary and save button
+        # Summary and save buttons
         initial_count = len(st.session_state.raw_trajectories)
         final_count = len(st.session_state.all_trajectories)
         removed_count = initial_count - final_count
 
-        col_status, col_save = st.columns([3, 1])
+        col_status, col_save_csv, col_save_pdf = st.columns([2, 1, 1])
         with col_status:
             if removed_count > 0:
-                st.success(f"✅ Analysis complete — **{final_count} valid balls** (removed {removed_count} outliers from {initial_count} detected)")
+                st.success(f"✅ **{final_count} valid balls** ({removed_count} filtered)")
             else:
-                st.success(f"✅ Analysis complete — **{final_count} balls** detected")
+                st.success(f"✅ **{final_count} balls** detected")
 
-        # Save button - only save when user clicks
-        with col_save:
-            if st.button("💾 Save Results", use_container_width=True):
+        # Save CSV/Chart button
+        with col_save_csv:
+            if st.button("💾 Save Data", use_container_width=True):
                 try:
                     video_dir = os.path.dirname(os.path.abspath(st.session_state.video_path))
                     timestamp = time.strftime("%Y%m%d_%H%M%S")
@@ -1270,9 +1544,37 @@ if st.session_state.analysis_complete and st.session_state.raw_trajectories:
                     st.error(f"❌ Error saving files: {str(e)}")
                 st.rerun()
 
+        # Save PDF Report button
+        with col_save_pdf:
+            if st.button("📄 Save PDF", use_container_width=True):
+                try:
+                    video_dir = os.path.dirname(os.path.abspath(st.session_state.video_path))
+                    timestamp = time.strftime("%Y%m%d_%H%M%S")
+                    filter_desc = f"lz{launch_time_percentile}_angle{min_angle}to{max_angle}_vel{min_velocity}"
+                    pdf_path = os.path.join(video_dir, f"ball_report_{filter_desc}_{timestamp}.pdf")
+
+                    generate_pdf_report(
+                        st.session_state.all_trajectories,
+                        st.session_state.ball_log,
+                        accuracy_data,
+                        filter_stats,
+                        width,
+                        height,
+                        target_height_pct,
+                        pdf_path
+                    )
+
+                    st.session_state.saved_pdf = pdf_path
+                    st.success(f"✅ PDF Saved!\n\n📄 Report: `{pdf_path}`")
+                except Exception as e:
+                    st.error(f"❌ Error saving PDF: {str(e)}")
+                st.rerun()
+
         # Show last saved files info
         if st.session_state.files_saved:
             st.info(f"Last saved:\n\n📊 Chart: `{st.session_state.saved_chart}`\n\n📄 Data: `{st.session_state.saved_csv}`")
+        if 'saved_pdf' in st.session_state and st.session_state.saved_pdf:
+            st.info(f"📄 PDF Report: `{st.session_state.saved_pdf}`")
 
         # DO NOT close the global fig - it's reused across reruns
         # plt.close(fig)  # REMOVED - would break subsequent reruns
