@@ -1040,10 +1040,11 @@ if temp_path and not st.session_state.analysis_complete:
         # Adjust tracking parameters based on view type
         is_dtl = (view_type == "Down-the-Line (DTL)")
         # High-speed DTL balls can jump significant pixel distances and appear as streaks
-        effective_match_threshold = match_threshold * (3.0 if is_dtl else 1.0)
-        effective_min_ball_area = MIN_BALL_AREA * (0.4 if is_dtl else 1.0) 
-        effective_sensitivity = sensitivity * (0.5 if is_dtl else 1.0) 
-        effective_memory_frames = memory_frames * (2 if is_dtl else 1) # Allow more missing frames for flickering detections
+        # Increase threshold further to handle high-velocity launches (e.g. 500+ px jumps)
+        effective_match_threshold = match_threshold * (6.0 if is_dtl else 1.0)
+        effective_min_ball_area = MIN_BALL_AREA * (0.3 if is_dtl else 1.0) 
+        effective_sensitivity = sensitivity * (0.4 if is_dtl else 1.0) 
+        effective_memory_frames = memory_frames * (3 if is_dtl else 1) # Allow more missing frames
 
         lower_yellow = np.array([20, sat_val, 100])
         upper_yellow = np.array([35, 255, 255])
@@ -1055,24 +1056,23 @@ if temp_path and not st.session_state.analysis_complete:
                 dx = path[-1][0] - path[-2][0]
                 dy = path[-1][1] - path[-2][1]
                 
-                # In DTL, pixel velocity changes as it moves away/towards center (depth)
+                # In DTL, pixel velocity decays as it moves away. 
+                # Gravity still applies but is less dominant than the Z-axis depth change.
                 if is_dtl:
-                    frame_center_y = height // 2
-                    if (path[-1][1] < frame_center_y and dy < 0) or (path[-1][1] > frame_center_y and dy > 0):
-                        dx *= 0.95
-                        dy *= 0.95
+                    dx *= 0.98
+                    dy *= 0.98
 
                 # Add gravity to vertical velocity (dy)
-                # Note: y coordinates are top-down, so gravity is positive.
                 return (path[-1][0] + dx, path[-1][1] + dy + GRAVITY_ACCEL)
             return path[-1]
 
         def direction_ok(path, new_pos, max_angle=120):
             if len(path) < 2:
                 return True
-            # Relax direction constraints slightly for DTL
+            # Relax direction constraints significantly for DTL to handle jittery detections
             if is_dtl:
-                max_angle = 150
+                return True # Trust the match_threshold and predict_pos for DTL
+                
             vx = path[-1][0] - path[-2][0]
             vy = path[-1][1] - path[-2][1]
             dx = new_pos[0] - path[-1][0]
@@ -1112,6 +1112,17 @@ if temp_path and not st.session_state.analysis_complete:
         def finalize(track):
             """Finalize a track and store in RAW data (Phase 1)"""
             p = track['path']
+            
+            # Displacement Filter: Ignore "tracks" that haven't moved significantly
+            # especially important for DTL where stationary balls on robot are detected
+            start_pos = np.array(p[0])
+            end_pos = np.array(p[-1])
+            total_displacement = np.linalg.norm(end_pos - start_pos)
+            
+            # If the ball hasn't moved at least 50 pixels (or 3x its size), ignore it
+            if total_displacement < 50:
+                return
+
             n = min(4, len(p))
             init_vel = sum(
                 np.linalg.norm(np.array(p[i+1]) - np.array(p[i])) * video_fps
