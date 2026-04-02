@@ -1039,9 +1039,11 @@ if temp_path and not st.session_state.analysis_complete:
 
         # Adjust tracking parameters based on view type
         is_dtl = (view_type == "Down-the-Line (DTL)")
-        effective_match_threshold = match_threshold * (1.5 if is_dtl else 1.0)
-        effective_min_ball_area = MIN_BALL_AREA * (0.5 if is_dtl else 1.0) # smaller blobs if far away
-        effective_sensitivity = sensitivity * (0.8 if is_dtl else 1.0) # less strict circularity
+        # High-speed DTL balls can jump significant pixel distances and appear as streaks
+        effective_match_threshold = match_threshold * (3.0 if is_dtl else 1.0)
+        effective_min_ball_area = MIN_BALL_AREA * (0.4 if is_dtl else 1.0) 
+        effective_sensitivity = sensitivity * (0.5 if is_dtl else 1.0) 
+        effective_memory_frames = memory_frames * (2 if is_dtl else 1) # Allow more missing frames for flickering detections
 
         lower_yellow = np.array([20, sat_val, 100])
         upper_yellow = np.array([35, 255, 255])
@@ -1241,7 +1243,7 @@ if temp_path and not st.session_state.analysis_complete:
                 track['missing_count'] += 1
                 track_age = len(track['path']) + track['missing_count']
                 expired = track_age > max_track_frames
-                lost = track['missing_count'] >= memory_frames
+                lost = track['missing_count'] >= effective_memory_frames
                 if (expired or lost) and len(track['path']) > MIN_TRAJECTORY_LENGTH:
                     finalize(track)
                 elif not expired and not lost:
