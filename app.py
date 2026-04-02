@@ -17,9 +17,33 @@ MIN_VELOCITY = 10  # px/s - minimum valid velocity (default, overridden by slide
 SPATIAL_FILTER_MULTIPLIER = 3.0
 MIN_LAUNCH_ZONE_RADIUS = 50  # pixels
 MAX_LAUNCH_ZONE_RADIUS = 200  # pixels
+GRAVITY_ACCEL = 0.5  # pixels per frame squared (estimated)
 
 st.set_page_config(layout="wide")
 st.title("🏹 Advanced Ball Analytics Dashboard")
+
+# --- Helper Functions (App State) ---
+
+def reset_app_state(rerun=True):
+    """Resets all session state variables to their initial values."""
+    keys_to_reset = [
+        'raw_trajectories', 'raw_ball_log', 'all_trajectories', 'ball_log',
+        'active_tracks', 'pause_frame', 'paused', 'next_ball_id',
+        'last_frame', 'launch_zone_center', 'launch_zone_radius',
+        'analysis_complete', 'files_saved', 'saved_csv', 'saved_chart', 'saved_pdf'
+    ]
+    for key in keys_to_reset:
+        if key in ['raw_trajectories', 'raw_ball_log', 'all_trajectories', 'ball_log', 'active_tracks']:
+            st.session_state[key] = []
+        elif key in ['pause_frame', 'next_ball_id']:
+            st.session_state[key] = 0 if key == 'pause_frame' else 1
+        elif key in ['paused', 'analysis_complete', 'files_saved']:
+            st.session_state[key] = False
+        else:
+            st.session_state[key] = None
+    
+    if rerun:
+        st.rerun()
 
 # --- SIDEBAR CONTROLS ---
 
@@ -34,7 +58,7 @@ sat_val = st.sidebar.slider("Yellow Threshold", 50, 255, 120)
 st.sidebar.caption("Minimum color saturation to detect as yellow.")
 
 st.sidebar.divider()
-st.sidebar.markdown("## 📊 Phase 2: Filtering")
+st.sidebar.markdown("## 📊 Analysis Phase")
 st.sidebar.caption("✨ Updates instantly when adjusted")
 st.sidebar.divider()
 
@@ -117,24 +141,7 @@ if 'video_fps' not in st.session_state:
     st.session_state.video_fps = 30
 
 if st.sidebar.button("Reset All Data"):
-    st.session_state.raw_trajectories = []
-    st.session_state.raw_ball_log = []
-    st.session_state.all_trajectories = []
-    st.session_state.ball_log = []
-    st.session_state.active_tracks = []
-    st.session_state.pause_frame = 0
-    st.session_state.paused = False
-    st.session_state.next_ball_id = 1
-    st.session_state.last_frame = None
-    st.session_state.launch_zone_center = None
-    st.session_state.launch_zone_radius = None
-    st.session_state.analysis_complete = False
-    st.session_state.files_saved = False
-    st.session_state.saved_csv = None
-    st.session_state.saved_chart = None
-    st.session_state.saved_pdf = None
-    st.rerun()
-
+    reset_app_state()
 
 col_upload, col_rerun_btn = st.columns([3, 1])
 
@@ -143,23 +150,7 @@ with col_upload:
 
 with col_rerun_btn:
     if st.button("🔄 Rerun Analysis", disabled=not st.session_state.video_path, use_container_width=True):
-        st.session_state.raw_trajectories = []
-        st.session_state.raw_ball_log = []
-        st.session_state.all_trajectories = []
-        st.session_state.ball_log = []
-        st.session_state.active_tracks = []
-        st.session_state.pause_frame = 0
-        st.session_state.paused = False
-        st.session_state.next_ball_id = 1
-        st.session_state.last_frame = None
-        st.session_state.launch_zone_center = None
-        st.session_state.launch_zone_radius = None
-        st.session_state.analysis_complete = False
-        st.session_state.files_saved = False
-        st.session_state.saved_csv = None
-        st.session_state.saved_chart = None
-        st.session_state.saved_pdf = None
-        st.rerun()
+        reset_app_state()
 
 if uploaded_file:
     temp_path = "temp_video.mov"
@@ -173,7 +164,7 @@ else:
 
 # Phase indicator (placed here so it knows the current state)
 if st.session_state.analysis_complete:
-    st.success("📊 **Phase 2: Interactive Filtering** - Adjust sliders to refine results")
+    st.success("📊 **Analysis Phase** - Adjust sliders to refine results")
 elif st.session_state.video_path and not st.session_state.analysis_complete:
     if st.session_state.raw_trajectories:
         st.info("🎬 **Phase 1: Video Analysis Complete** - Applying filters...")
@@ -197,7 +188,7 @@ log_table = st.empty()
 
 # Create matplotlib figure for trajectory chart (reused across renders)
 fig, ax = plt.subplots(figsize=(6, 5))
-colormap = cm.get_cmap('gist_rainbow')
+colormap = plt.get_cmap('gist_rainbow')
 
 # --- Unified Render Functions (module level, available to both phases) ---
 
@@ -505,8 +496,8 @@ def generate_pdf_report(trajectories, ball_log, accuracy_data, filter_stats, wid
         # Page 1: Trajectory Chart
         fig_traj = plt.figure(figsize=(11, 8.5))
         ax_traj = fig_traj.add_subplot(111)
-        ax_traj.set_facecolor('#1e1e1e')
-        fig_traj.patch.set_facecolor('#1e1e1e')
+        ax_traj.set_facecolor('white')
+        fig_traj.patch.set_facecolor('white')
 
         # Build sequence map
         sorted_log = sorted(ball_log, key=lambda x: x['Launch Time (s)'])
@@ -526,25 +517,25 @@ def generate_pdf_report(trajectories, ball_log, accuracy_data, filter_stats, wid
         if filter_stats.get('launch_zone_info'):
             lz = filter_stats['launch_zone_info']
             circle = plt.Circle((lz['center'][0], -lz['center'][1]), lz['radius'],
-                               color='cyan', fill=False, linewidth=2, linestyle='--', alpha=0.8)
+                               color='darkcyan', fill=False, linewidth=2, linestyle='--', alpha=0.8)
             ax_traj.add_patch(circle)
-            ax_traj.plot(lz['center'][0], -lz['center'][1], 'x', color='cyan', markersize=12, markeredgewidth=2)
+            ax_traj.plot(lz['center'][0], -lz['center'][1], 'x', color='darkcyan', markersize=12, markeredgewidth=2)
 
         ax_traj.autoscale(enable=True, axis='both', tight=False)
         ax_traj.margins(0.05)
-        ax_traj.set_xlabel('X Position (px)', color='white', fontsize=12)
-        ax_traj.set_ylabel('Y Position (px)', color='white', fontsize=12)
-        ax_traj.set_title('Ball Trajectories', color='white', fontsize=14, fontweight='bold')
-        ax_traj.tick_params(colors='white')
+        ax_traj.set_xlabel('X Position (px)', color='black', fontsize=12)
+        ax_traj.set_ylabel('Y Position (px)', color='black', fontsize=12)
+        ax_traj.set_title('Ball Trajectories', color='black', fontsize=14, fontweight='bold')
+        ax_traj.tick_params(colors='black')
         for spine in ax_traj.spines.values():
             spine.set_color('#444')
-        ax_traj.grid(True, alpha=0.3, color='white')
-        pdf.savefig(fig_traj, facecolor='#1e1e1e')
+        ax_traj.grid(True, alpha=0.3, color='grey')
+        pdf.savefig(fig_traj, facecolor='white')
         plt.close(fig_traj)
 
         # Page 2: Summary Statistics and Distributions
         fig_stats = plt.figure(figsize=(11, 8.5))
-        fig_stats.patch.set_facecolor('#1e1e1e')
+        fig_stats.patch.set_facecolor('white')
 
         # Summary text
         ax_summary = fig_stats.add_subplot(4, 1, 1)
@@ -562,103 +553,103 @@ def generate_pdf_report(trajectories, ball_log, accuracy_data, filter_stats, wid
         summary_text += f"Launch Angle: {df['Launch Angle (°)'].mean():.1f} ± {df['Launch Angle (°)'].std():.1f}°\n"
         summary_text += f"Max Height: {df['Max Height (px from top)'].mean():.0f} ± {df['Max Height (px from top)'].std():.0f} px"
 
-        ax_summary.text(0.05, 0.5, summary_text, fontsize=12, color='white',
+        ax_summary.text(0.05, 0.5, summary_text, fontsize=12, color='black',
                        verticalalignment='center', family='monospace')
 
         # Angle distribution
         ax_angle = fig_stats.add_subplot(4, 1, 2)
-        ax_angle.set_facecolor('#1e1e1e')
+        ax_angle.set_facecolor('white')
         angles = df['Launch Angle (°)']
-        ax_angle.hist(angles, bins=min(20, len(df)), color='#ff7f0e', alpha=0.7, edgecolor='white')
+        ax_angle.hist(angles, bins=min(20, len(df)), color='#ff7f0e', alpha=0.7, edgecolor='black')
         ax_angle.axvline(angles.mean(), color='red', linestyle='--', linewidth=2)
-        ax_angle.set_xlabel('Launch Angle (°)', color='white')
-        ax_angle.set_ylabel('Count', color='white')
-        ax_angle.set_title('Launch Angle Distribution', color='white', fontweight='bold')
-        ax_angle.tick_params(colors='white')
+        ax_angle.set_xlabel('Launch Angle (°)', color='black')
+        ax_angle.set_ylabel('Count', color='black')
+        ax_angle.set_title('Launch Angle Distribution', color='black', fontweight='bold')
+        ax_angle.tick_params(colors='black')
         for spine in ax_angle.spines.values():
             spine.set_color('#444')
 
         # Height distribution
         ax_height = fig_stats.add_subplot(4, 1, 3)
-        ax_height.set_facecolor('#1e1e1e')
+        ax_height.set_facecolor('white')
         heights = df['Max Height (px from top)']
-        ax_height.hist(heights, bins=min(20, len(df)), color='#2ecc71', alpha=0.7, edgecolor='white')
+        ax_height.hist(heights, bins=min(20, len(df)), color='#2ecc71', alpha=0.7, edgecolor='black')
         ax_height.axvline(heights.mean(), color='red', linestyle='--', linewidth=2)
-        ax_height.set_xlabel('Max Height (px)', color='white')
-        ax_height.set_ylabel('Count', color='white')
-        ax_height.set_title('Max Height Distribution', color='white', fontweight='bold')
-        ax_height.tick_params(colors='white')
+        ax_height.set_xlabel('Max Height (px)', color='black')
+        ax_height.set_ylabel('Count', color='black')
+        ax_height.set_title('Max Height Distribution', color='black', fontweight='bold')
+        ax_height.tick_params(colors='black')
         for spine in ax_height.spines.values():
             spine.set_color('#444')
 
         # Velocity distribution
         ax_vel = fig_stats.add_subplot(4, 1, 4)
-        ax_vel.set_facecolor('#1e1e1e')
+        ax_vel.set_facecolor('white')
         vels = df['Initial Velocity (px/s)']
-        ax_vel.hist(vels, bins=min(20, len(df)), color='#00bfff', alpha=0.7, edgecolor='white')
+        ax_vel.hist(vels, bins=min(20, len(df)), color='#00bfff', alpha=0.7, edgecolor='black')
         ax_vel.axvline(vels.mean(), color='red', linestyle='--', linewidth=2)
-        ax_vel.set_xlabel('Initial Velocity (px/s)', color='white')
-        ax_vel.set_ylabel('Count', color='white')
-        ax_vel.set_title('Velocity Distribution', color='white', fontweight='bold')
-        ax_vel.tick_params(colors='white')
+        ax_vel.set_xlabel('Initial Velocity (px/s)', color='black')
+        ax_vel.set_ylabel('Count', color='black')
+        ax_vel.set_title('Velocity Distribution', color='black', fontweight='bold')
+        ax_vel.tick_params(colors='black')
         for spine in ax_vel.spines.values():
             spine.set_color('#444')
 
         fig_stats.tight_layout()
-        pdf.savefig(fig_stats, facecolor='#1e1e1e')
+        pdf.savefig(fig_stats, facecolor='white')
         plt.close(fig_stats)
 
         # Page 3: Trend Charts
         if len(df) >= 2:
             fig_trend = plt.figure(figsize=(11, 8.5))
-            fig_trend.patch.set_facecolor('#1e1e1e')
+            fig_trend.patch.set_facecolor('white')
 
             x = df["Launch Time (s)"]
 
             ax1 = fig_trend.add_subplot(3, 1, 1)
-            ax1.set_facecolor('#1e1e1e')
+            ax1.set_facecolor('white')
             ax1.plot(x, df["Initial Velocity (px/s)"], 'o-', color='#00bfff', linewidth=2, markersize=6)
             ax1.axhline(df["Initial Velocity (px/s)"].mean(), color='#00bfff', linestyle='--', alpha=0.4, linewidth=2)
-            ax1.set_ylabel("Velocity (px/s)", color='white', fontsize=11)
-            ax1.tick_params(colors='white')
-            ax1.set_title('Performance Trends Over Time', color='white', fontsize=14, fontweight='bold')
+            ax1.set_ylabel("Velocity (px/s)", color='black', fontsize=11)
+            ax1.tick_params(colors='black')
+            ax1.set_title('Performance Trends Over Time', color='black', fontsize=14, fontweight='bold')
             for spine in ax1.spines.values():
                 spine.set_color('#444')
-            ax1.grid(True, alpha=0.3, color='white')
+            ax1.grid(True, alpha=0.3, color='grey')
 
             ax2 = fig_trend.add_subplot(3, 1, 2)
-            ax2.set_facecolor('#1e1e1e')
+            ax2.set_facecolor('white')
             ax2.plot(x, df["Launch Angle (°)"], 'o-', color='#ff7f0e', linewidth=2, markersize=6)
             ax2.axhline(df["Launch Angle (°)"].mean(), color='#ff7f0e', linestyle='--', alpha=0.4, linewidth=2)
-            ax2.set_ylabel("Angle (°)", color='white', fontsize=11)
-            ax2.tick_params(colors='white')
+            ax2.set_ylabel("Angle (°)", color='black', fontsize=11)
+            ax2.tick_params(colors='black')
             for spine in ax2.spines.values():
                 spine.set_color('#444')
-            ax2.grid(True, alpha=0.3, color='white')
+            ax2.grid(True, alpha=0.3, color='grey')
 
             ax3 = fig_trend.add_subplot(3, 1, 3)
-            ax3.set_facecolor('#1e1e1e')
+            ax3.set_facecolor('white')
             ax3.plot(x, df["Max Height (px from top)"], 'o-', color='#2ecc71', linewidth=2, markersize=6)
             ax3.axhline(df["Max Height (px from top)"].mean(), color='#2ecc71', linestyle='--', alpha=0.4, linewidth=2)
-            ax3.set_ylabel("Height (px)", color='white', fontsize=11)
-            ax3.set_xlabel("Time (s)", color='white', fontsize=11)
-            ax3.tick_params(colors='white')
+            ax3.set_ylabel("Height (px)", color='black', fontsize=11)
+            ax3.set_xlabel("Time (s)", color='black', fontsize=11)
+            ax3.tick_params(colors='black')
             for spine in ax3.spines.values():
                 spine.set_color('#444')
-            ax3.grid(True, alpha=0.3, color='white')
+            ax3.grid(True, alpha=0.3, color='grey')
 
             fig_trend.tight_layout()
-            pdf.savefig(fig_trend, facecolor='#1e1e1e')
+            pdf.savefig(fig_trend, facecolor='white')
             plt.close(fig_trend)
 
         # Page 4: Target Accuracy (if available)
         if accuracy_data is not None:
             fig_acc = plt.figure(figsize=(11, 8.5))
-            fig_acc.patch.set_facecolor('#1e1e1e')
+            fig_acc.patch.set_facecolor('white')
 
             # Top: Trajectories with target line
             ax_top = fig_acc.add_subplot(2, 1, 1)
-            ax_top.set_facecolor('#1e1e1e')
+            ax_top.set_facecolor('white')
 
             for track in trajectories:
                 pts = np.array(track['path'])
@@ -680,39 +671,100 @@ def generate_pdf_report(trajectories, ball_log, accuracy_data, filter_stats, wid
             ax_top.autoscale(enable=True, axis='x', tight=False)
             ax_top.margins(x=0.1, y=0)  # 10% padding on x-axis
             ax_top.set_ylim(height, 0)  # Keep full Y range
-            ax_top.set_xlabel('X Position (px)', color='white', fontsize=11)
-            ax_top.set_ylabel('Y Position (px)', color='white', fontsize=11)
-            ax_top.set_title(f'Target Accuracy Analysis - {target_height_pct}% Height', color='white', fontsize=14, fontweight='bold')
-            ax_top.tick_params(colors='white')
+            ax_top.set_xlabel('X Position (px)', color='black', fontsize=11)
+            ax_top.set_ylabel('Y Position (px)', color='black', fontsize=11)
+            ax_top.set_title(f'Target Accuracy Analysis - {target_height_pct}% Height', color='black', fontsize=14, fontweight='bold')
+            ax_top.tick_params(colors='black')
             for spine in ax_top.spines.values():
                 spine.set_color('#444')
-            ax_top.grid(True, alpha=0.3, color='white')
-            ax_top.legend(facecolor='#1e1e1e', edgecolor='#444', labelcolor='white')
+            ax_top.grid(True, alpha=0.3, color='grey')
+            ax_top.legend(facecolor='white', edgecolor='#444', labelcolor='black')
 
             # Bottom: Accuracy metrics and scatter
             ax_bottom = fig_acc.add_subplot(2, 1, 2)
-            ax_bottom.set_facecolor('#1e1e1e')
+            ax_bottom.set_facecolor('white')
 
             x_positions = [i['x'] for i in accuracy_data['intercepts']]
             times = [i['launch_time'] for i in accuracy_data['intercepts']]
 
-            ax_bottom.scatter(times, x_positions, c='cyan', s=100, alpha=0.8, edgecolors='white')
+            ax_bottom.scatter(times, x_positions, c='cyan', s=100, alpha=0.8, edgecolors='black')
             ax_bottom.axhline(accuracy_data['mean_x'], color='green', linestyle='-', linewidth=2)
-            ax_bottom.axhline(accuracy_data['mean_x'] + accuracy_data['std_x'], color='yellow', linestyle='--', alpha=0.6)
-            ax_bottom.axhline(accuracy_data['mean_x'] - accuracy_data['std_x'], color='yellow', linestyle='--', alpha=0.6)
+            ax_bottom.axhline(accuracy_data['mean_x'] + accuracy_data['std_x'], color='orange', linestyle='--', alpha=0.6)
+            ax_bottom.axhline(accuracy_data['mean_x'] - accuracy_data['std_x'], color='orange', linestyle='--', alpha=0.6)
 
-            ax_bottom.set_xlabel('Launch Time (s)', color='white', fontsize=11)
-            ax_bottom.set_ylabel('X Position at Target (px)', color='white', fontsize=11)
+            ax_bottom.set_xlabel('Launch Time (s)', color='black', fontsize=11)
+            ax_bottom.set_ylabel('X Position at Target (px)', color='black', fontsize=11)
             ax_bottom.set_title(f'Accuracy: Mean={accuracy_data["mean_x"]:.0f}px, Spread={accuracy_data["std_x"]:.0f}px, CEP={accuracy_data["cep"]:.0f}px',
-                               color='white', fontsize=12)
-            ax_bottom.tick_params(colors='white')
+                               color='black', fontsize=12)
+            ax_bottom.tick_params(colors='black')
             for spine in ax_bottom.spines.values():
                 spine.set_color('#444')
-            ax_bottom.grid(True, alpha=0.3, color='white')
+            ax_bottom.grid(True, alpha=0.3, color='grey')
 
             fig_acc.tight_layout()
-            pdf.savefig(fig_acc, facecolor='#1e1e1e')
+            pdf.savefig(fig_acc, facecolor='white')
             plt.close(fig_acc)
+
+            # Page 5: Correlation Analysis (if available)
+            if len(accuracy_data['intercepts']) >= 3:
+                # Build correlation dataframe
+                corr_data = []
+                for intercept in accuracy_data['intercepts']:
+                    ball_id = intercept['ball_id']
+                    for log_entry in ball_log:
+                        if log_entry['Ball #'] == ball_id:
+                            corr_data.append({
+                                'Target X': intercept['x'],
+                                'Velocity': log_entry['Initial Velocity (px/s)'],
+                                'Angle': log_entry['Launch Angle (°)'],
+                                'Max Height': log_entry['Max Height (px from top)'],
+                                'Launch Time': log_entry['Launch Time (s)']
+                            })
+                            break
+                
+                if corr_data:
+                    corr_df = pd.DataFrame(corr_data)
+                    correlations = corr_df.corr()['Target X'].drop('Target X')
+                    
+                    fig_corr, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(11, 8.5))
+                    fig_corr.patch.set_facecolor('white')
+                    
+                    metrics = [
+                        ('Velocity', 'Velocity', ax1, '#00bfff', 'Initial Velocity (px/s)'),
+                        ('Angle', 'Angle', ax2, '#ff7f0e', 'Launch Angle (°)'),
+                        ('Max Height', 'Max Height', ax3, '#2ecc71', 'Max Height (px from top)'),
+                        ('Launch Time', 'Launch Time', ax4, '#9467bd', 'Launch Time (s)')
+                    ]
+                    
+                    for metric_name, col_name, ax, color, xlabel in metrics:
+                        ax.set_facecolor('white')
+                        ax.tick_params(colors='black')
+                        for spine in ax.spines.values():
+                            spine.set_color('#444')
+                        
+                        x_data = corr_df[col_name]
+                        y_data = corr_df['Target X']
+                        corr_val = correlations.get(metric_name, 0)
+                        
+                        ax.scatter(x_data, y_data, c=color, s=80, alpha=0.6, edgecolors='black', linewidth=0.5)
+                        
+                        # Add trend line
+                        if not np.isnan(corr_val) and abs(corr_val) > 0.01:
+                            try:
+                                z = np.polyfit(x_data, y_data, 1)
+                                p = np.poly1d(z)
+                                x_line = np.linspace(x_data.min(), x_data.max(), 100)
+                                ax.plot(x_line, p(x_line), '--', color='red', linewidth=1.5, alpha=0.6)
+                            except: pass
+                            
+                        ax.set_xlabel(xlabel, color='black', fontsize=10)
+                        ax.set_ylabel('Target X (px)', color='black', fontsize=10)
+                        ax.set_title(f'{metric_name} Correlation: {corr_val:.3f}', color='black', fontsize=12, fontweight='bold')
+                        ax.grid(True, alpha=0.3, color='grey')
+                    
+                    fig_corr.tight_layout(pad=3.0)
+                    pdf.savefig(fig_corr, facecolor='white')
+                    plt.close(fig_corr)
 
         # PDF metadata
         d = pdf.infodict()
@@ -891,6 +943,46 @@ def render_accuracy_analysis(accuracy_data, trajectories, ball_log, target_heigh
 
             st.caption("*Correlation ranges from -1 (strong negative) to +1 (strong positive). Values near 0 indicate weak correlation.*")
 
+            # Correlation scatter plots
+            fig_corr, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(12, 8))
+            fig_corr.patch.set_facecolor('#1e1e1e')
+
+            metrics = [
+                ('Velocity', 'Velocity', ax1, '#00bfff', 'Initial Velocity (px/s)'),
+                ('Angle', 'Angle', ax2, '#ff7f0e', 'Launch Angle (°)'),
+                ('Max Height', 'Max Height', ax3, '#2ecc71', 'Max Height (px from top)'),
+                ('Launch Time', 'Launch Time', ax4, '#9467bd', 'Launch Time (s)')
+            ]
+
+            for metric_name, col_name, ax, color, xlabel in metrics:
+                ax.set_facecolor('#1e1e1e')
+                ax.tick_params(colors='white')
+                for spine in ax.spines.values():
+                    spine.set_color('#444')
+
+                x_data = corr_df[col_name]
+                y_data = corr_df['Target X']
+                corr_val = correlations.get(metric_name, 0)
+
+                # Scatter plot
+                ax.scatter(x_data, y_data, c=color, s=80, alpha=0.7, edgecolors='white', linewidth=1)
+
+                # Add trend line if correlation is significant
+                if abs(corr_val) > 0.1:
+                    z = np.polyfit(x_data, y_data, 1)
+                    p = np.poly1d(z)
+                    x_line = np.linspace(x_data.min(), x_data.max(), 100)
+                    ax.plot(x_line, p(x_line), '--', color='red', linewidth=2, alpha=0.6)
+
+                ax.set_xlabel(xlabel, color='white', fontsize=9)
+                ax.set_ylabel('Target X (px)', color='white', fontsize=9)
+                ax.set_title(f'{metric_name}\nCorr: {corr_val:.3f}', color='white', fontsize=10, fontweight='bold')
+                ax.grid(True, alpha=0.2, color='white')
+
+            fig_corr.tight_layout()
+            st.pyplot(fig_corr)
+            plt.close(fig_corr)
+
 # --- End Unified Render Functions ---
 
 if temp_path and not st.session_state.analysis_complete:
@@ -919,7 +1011,9 @@ if temp_path and not st.session_state.analysis_complete:
             if len(path) >= 2:
                 dx = path[-1][0] - path[-2][0]
                 dy = path[-1][1] - path[-2][1]
-                return (path[-1][0] + dx, path[-1][1] + dy)
+                # Add gravity to vertical velocity (dy)
+                # Note: y coordinates are top-down, so gravity is positive.
+                return (path[-1][0] + dx, path[-1][1] + dy + GRAVITY_ACCEL)
             return path[-1]
 
         def direction_ok(path, new_pos, max_angle=120):
@@ -1167,6 +1261,7 @@ if temp_path and not st.session_state.analysis_complete:
 
         # Mark analysis as complete
         st.session_state.analysis_complete = True
+        st.rerun()
 
 # PHASE 2: Interactive Filtering Function (callable anytime)
 def apply_filters(raw_trajectories, raw_ball_log, launch_time_pct, enable_stats, stats_sens, min_ang, max_ang, min_vel, min_ht, max_ht):
