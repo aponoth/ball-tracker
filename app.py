@@ -1220,26 +1220,36 @@ if temp_path and not st.session_state.analysis_complete:
             # 2. Tracking & Velocity Calculation
             max_track_frames = int(video_fps * MAX_FLIGHT_TIME_SEC)
 
-            new_active = []
-            for center in current_centers:
-                matched = False
-                best_dist = effective_match_threshold
-                best_track = None
-                for track in active_tracks:
+            # --- Global Greedy Data Association ---
+            # Instead of first-come-first-served, we find the globally best matches
+            potential_matches = []
+            for c_idx, center in enumerate(current_centers):
+                for t_idx, track in enumerate(active_tracks):
                     predicted = predict_pos(track['path'])
                     dist = np.linalg.norm(np.array(center) - np.array(predicted))
-                    if dist < best_dist and direction_ok(track['path'], center):
-                        best_dist = dist
-                        best_track = track
-                if best_track is not None:
-                    best_track['path'].append(center)
-                    best_track['missing_count'] = 0
-                    new_active.append(best_track)
-                    active_tracks.remove(best_track)
-                    matched = True
-
-                if not matched:
-                    # Create new track for any unmatched detection
+                    if dist < effective_match_threshold and direction_ok(track['path'], center):
+                        potential_matches.append((dist, c_idx, t_idx))
+            
+            # Sort matches by distance
+            potential_matches.sort(key=lambda x: x[0])
+            
+            matched_centers = set()
+            matched_tracks = set()
+            new_active = []
+            
+            for dist, c_idx, t_idx in potential_matches:
+                if c_idx not in matched_centers and t_idx not in matched_tracks:
+                    center = current_centers[c_idx]
+                    track = active_tracks[t_idx]
+                    track['path'].append(center)
+                    track['missing_count'] = 0
+                    new_active.append(track)
+                    matched_centers.add(c_idx)
+                    matched_tracks.add(t_idx)
+            
+            # Create new tracks for unmatched centers
+            for c_idx, center in enumerate(current_centers):
+                if c_idx not in matched_centers:
                     ball_id = st.session_state.next_ball_id
                     st.session_state.next_ball_id += 1
                     new_active.append({
@@ -1249,16 +1259,20 @@ if temp_path and not st.session_state.analysis_complete:
                         'missing_count': 0,
                         'start_time': current_timestamp
                     })
-
-            for track in active_tracks:
-                track['missing_count'] += 1
-                track_age = len(track['path']) + track['missing_count']
-                expired = track_age > max_track_frames
-                lost = track['missing_count'] >= effective_memory_frames
-                if (expired or lost) and len(track['path']) > MIN_TRAJECTORY_LENGTH:
-                    finalize(track)
-                elif not expired and not lost:
-                    new_active.append(track)
+            
+            # Handle unmatched (missing) tracks
+            for t_idx, track in enumerate(active_tracks):
+                if t_idx not in matched_tracks:
+                    track['missing_count'] += 1
+                    track_age = len(track['path']) + track['missing_count']
+                    expired = track_age > max_track_frames
+                    lost = track['missing_count'] >= effective_memory_frames
+                    if (expired or lost) and len(track['path']) > MIN_TRAJECTORY_LENGTH:
+                        finalize(track)
+                    elif not expired and not lost:
+                        new_active.append(track)
+            
+            # --------------------------------------
             
             # Finalize tracks whose ballistic arc was interrupted by a bounce
             still_flying = []
@@ -1274,8 +1288,17 @@ if temp_path and not st.session_state.analysis_complete:
             st.session_state.active_tracks = active_tracks
             st.session_state.pause_frame = frame_count
 
-            # Draw tracking boxes with ball numbers
+            # Draw tracking boxes with ball numbers (Only for MOVING tracks)
             for track in active_tracks:
+                if len(track['path']) < 2: continue
+                
+                # Stationary filter for LIVE display: 
+                # Don't show boxes for things that haven't moved yet (like balls on robot)
+                start_p = np.array(track['path'][0])
+                curr_p = np.array(track['path'][-1])
+                if np.linalg.norm(curr_p - start_p) < 30:
+                    continue
+
                 center = track['path'][-1]
                 r, g, b, _ = track['color']
                 color_bgr = (int(b * 255), int(g * 255), int(r * 255))
@@ -1287,7 +1310,7 @@ if temp_path and not st.session_state.analysis_complete:
 
             # --- Snapshots Capture Logic ---
             # Capture 6 snapshots at different points in the video (where balls exist)
-            snapshot_interval = total_frames // 10
+            snapshot_interval = max(1, total_frames // 10)
             if len(st.session_state.detection_snapshots) < 6:
                 if frame_count % snapshot_interval == 0 and len(active_tracks) > 0:
                     st.session_state.detection_snapshots.append(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
@@ -1323,10 +1346,9 @@ if temp_path and not st.session_state.analysis_complete:
             t_total = time.time() - t_frame_start
             print(f"[frame {frame_count:04d}] total={t_total*1000:.1f}ms | cv={( t_cv - t_frame_start)*1000:.1f}ms | video_feed={(t_video - t_cv)*1000:.1f}ms | graph={(t_graph_end - t_graph_start)*1000:.1f}ms | balls={len(st.session_state.raw_trajectories)}")
 
-            # Sync Playback
-            elapsed = time.time() - start_process_time
-            delay = max(0, (1.0 / (video_fps * speed)) - elapsed)
-            time.sleep(delay)
+            # REMOVED: Sync Playback (speed) sleep to ensure frame-by-frame processing is thorough
+            # delay = max(0, (1.0 / (video_fps * speed)) - elapsed)
+            # time.sleep(delay)
 
         cap.release()
 
