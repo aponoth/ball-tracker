@@ -30,10 +30,11 @@ def reset_app_state(rerun=True):
         'raw_trajectories', 'raw_ball_log', 'all_trajectories', 'ball_log',
         'active_tracks', 'pause_frame', 'paused', 'next_ball_id',
         'last_frame', 'launch_zone_center', 'launch_zone_radius',
-        'analysis_complete', 'files_saved', 'saved_csv', 'saved_chart', 'saved_pdf'
+        'analysis_complete', 'files_saved', 'saved_csv', 'saved_chart', 'saved_pdf',
+        'detection_snapshots'
     ]
     for key in keys_to_reset:
-        if key in ['raw_trajectories', 'raw_ball_log', 'all_trajectories', 'ball_log', 'active_tracks']:
+        if key in ['raw_trajectories', 'raw_ball_log', 'all_trajectories', 'ball_log', 'active_tracks', 'detection_snapshots']:
             st.session_state[key] = []
         elif key in ['pause_frame', 'next_ball_id']:
             st.session_state[key] = 0 if key == 'pause_frame' else 1
@@ -109,6 +110,8 @@ if 'ball_log' not in st.session_state:
     st.session_state.ball_log = []  # Filtered log for display
 if 'video_path' not in st.session_state:
     st.session_state.video_path = None
+if 'original_filename' not in st.session_state:
+    st.session_state.original_filename = "video"
 if 'paused' not in st.session_state:
     st.session_state.paused = False
 if 'pause_frame' not in st.session_state:
@@ -123,6 +126,8 @@ if 'launch_zone_center' not in st.session_state:
     st.session_state.launch_zone_center = None
 if 'launch_zone_radius' not in st.session_state:
     st.session_state.launch_zone_radius = None
+if 'detection_snapshots' not in st.session_state:
+    st.session_state.detection_snapshots = []
 if 'analysis_complete' not in st.session_state:
     st.session_state.analysis_complete = False
 if 'files_saved' not in st.session_state:
@@ -157,6 +162,7 @@ if uploaded_file:
     with open(temp_path, "wb") as f:
         f.write(uploaded_file.read())
     st.session_state.video_path = temp_path
+    st.session_state.original_filename = os.path.splitext(uploaded_file.name)[0]
 elif st.session_state.video_path:
     temp_path = st.session_state.video_path
 else:
@@ -490,14 +496,16 @@ def calculate_target_accuracy(trajectories, ball_log, target_y_px, frame_height)
         'intercept_map': intercept_map
     }
 
-def generate_pdf_report(trajectories, ball_log, accuracy_data, filter_stats, width, height, target_height_pct, output_path):
+def generate_pdf_report(trajectories, ball_log, accuracy_data, filter_stats, width, height, target_height_pct, output_path, snapshots=[]):
     """Generate comprehensive PDF report with all visualizations and statistics."""
     with PdfPages(output_path) as pdf:
-        # Page 1: Trajectory Chart
-        fig_traj = plt.figure(figsize=(11, 8.5))
-        ax_traj = fig_traj.add_subplot(111)
+        # Page 1: Detection Overview (Chart + Snapshots)
+        fig_overview = plt.figure(figsize=(11, 8.5))
+        fig_overview.patch.set_facecolor('white')
+
+        # Top: Trajectory Chart (occupies top ~45%)
+        ax_traj = fig_overview.add_axes([0.1, 0.55, 0.8, 0.35])  # [left, bottom, width, height]
         ax_traj.set_facecolor('white')
-        fig_traj.patch.set_facecolor('white')
 
         # Build sequence map
         sorted_log = sorted(ball_log, key=lambda x: x['Launch Time (s)'])
@@ -510,7 +518,7 @@ def generate_pdf_report(trajectories, ball_log, accuracy_data, filter_stats, wid
             end_idx = -1
             ax_traj.text(pts[end_idx, 0], -pts[end_idx, 1],
                         str(ball_id_to_seq.get(track['id'], track['id'])),
-                        color=track['color'], fontsize=11, fontweight='bold',
+                        color=track['color'], fontsize=10, fontweight='bold',
                         ha='center', va='center')
 
         # Draw launch zone
@@ -519,19 +527,33 @@ def generate_pdf_report(trajectories, ball_log, accuracy_data, filter_stats, wid
             circle = plt.Circle((lz['center'][0], -lz['center'][1]), lz['radius'],
                                color='darkcyan', fill=False, linewidth=2, linestyle='--', alpha=0.8)
             ax_traj.add_patch(circle)
-            ax_traj.plot(lz['center'][0], -lz['center'][1], 'x', color='darkcyan', markersize=12, markeredgewidth=2)
+            ax_traj.plot(lz['center'][0], -lz['center'][1], 'x', color='darkcyan', markersize=10, markeredgewidth=2)
 
         ax_traj.autoscale(enable=True, axis='both', tight=False)
         ax_traj.margins(0.05)
-        ax_traj.set_xlabel('X Position (px)', color='black', fontsize=12)
-        ax_traj.set_ylabel('Y Position (px)', color='black', fontsize=12)
-        ax_traj.set_title('Ball Trajectories', color='black', fontsize=14, fontweight='bold')
-        ax_traj.tick_params(colors='black')
+        ax_traj.set_xlabel('X Position (px)', color='black', fontsize=10)
+        ax_traj.set_ylabel('Y Position (px)', color='black', fontsize=10)
+        ax_traj.set_title('Ball Trajectories & Analysis Overview', color='black', fontsize=12, fontweight='bold')
+        ax_traj.tick_params(colors='black', labelsize=8)
         for spine in ax_traj.spines.values():
             spine.set_color('#444')
         ax_traj.grid(True, alpha=0.3, color='grey')
-        pdf.savefig(fig_traj, facecolor='white')
-        plt.close(fig_traj)
+
+        # Bottom: 6 Snapshots in a 2x3 grid (occupies bottom ~45%)
+        if snapshots:
+            st.write(f"Adding {len(snapshots)} snapshots to report...") # Debug
+            for i, snap in enumerate(snapshots[:6]):
+                row = 1 - (i // 3)  # 0 or 1, inverted for bottom-up axes coords
+                col = i % 3         # 0, 1, or 2
+                
+                # Axes position: [left, bottom, width, height]
+                ax_snap = fig_overview.add_axes([0.05 + col*0.31, 0.05 + row*0.22, 0.28, 0.20])
+                ax_snap.imshow(snap)
+                ax_snap.axis('off')
+                ax_snap.set_title(f"Detection {i+1}", fontsize=8, color='black')
+
+        pdf.savefig(fig_overview, facecolor='white')
+        plt.close(fig_overview)
 
         # Page 2: Summary Statistics and Distributions
         fig_stats = plt.figure(figsize=(11, 8.5))
@@ -1215,6 +1237,14 @@ if temp_path and not st.session_state.analysis_complete:
                 cv2.putText(frame, label, (center[0] - tw // 2, center[1] - 20),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.7, color_bgr, 2)
 
+            # --- Snapshots Capture Logic ---
+            # Capture 6 snapshots at different points in the video (where balls exist)
+            snapshot_interval = total_frames // 10
+            if len(st.session_state.detection_snapshots) < 6:
+                if frame_count % snapshot_interval == 0 and len(active_tracks) > 0:
+                    st.session_state.detection_snapshots.append(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+            # -------------------------------
+
             # 3. UI Updates
             finalized_count = len(st.session_state.raw_trajectories)
             cv2.putText(frame, f"Time: {current_timestamp:.2f}s", (50, 50),
@@ -1622,13 +1652,14 @@ if st.session_state.analysis_complete and st.session_state.raw_trajectories:
                     if 'Ball #' in save_df.columns:
                         save_df = save_df.drop(columns=['Ball #'])
 
-                    # Create filenames with filter settings for clarity
+                    # Create filenames with original video name and filter settings for clarity
+                    video_name = st.session_state.original_filename
                     filter_desc = f"lz{launch_time_percentile}_angle{min_angle}to{max_angle}_vel{min_velocity}"
-                    csv_path = os.path.join(video_dir, f"ball_analysis_{filter_desc}_{timestamp}.csv")
+                    csv_path = os.path.join(video_dir, f"ball_analysis_{video_name}_{filter_desc}_{timestamp}.csv")
                     save_df.to_csv(csv_path, index=False)
 
                     # Save trajectory chart (the current filtered view)
-                    chart_path = os.path.join(video_dir, f"trajectory_chart_{filter_desc}_{timestamp}.jpg")
+                    chart_path = os.path.join(video_dir, f"trajectory_chart_{video_name}_{filter_desc}_{timestamp}.jpg")
                     fig.savefig(chart_path, dpi=150, bbox_inches='tight', facecolor='#1e1e1e')
 
                     st.session_state.files_saved = True
@@ -1645,8 +1676,8 @@ if st.session_state.analysis_complete and st.session_state.raw_trajectories:
                 try:
                     video_dir = os.path.dirname(os.path.abspath(st.session_state.video_path))
                     timestamp = time.strftime("%Y%m%d_%H%M%S")
-                    filter_desc = f"lz{launch_time_percentile}_angle{min_angle}to{max_angle}_vel{min_velocity}"
-                    pdf_path = os.path.join(video_dir, f"ball_report_{filter_desc}_{timestamp}.pdf")
+                    video_name = st.session_state.original_filename
+                    pdf_path = os.path.join(video_dir, f"ball_report_{video_name}_{timestamp}.pdf")
 
                     generate_pdf_report(
                         st.session_state.all_trajectories,
@@ -1656,7 +1687,8 @@ if st.session_state.analysis_complete and st.session_state.raw_trajectories:
                         width,
                         height,
                         target_height_pct,
-                        pdf_path
+                        pdf_path,
+                        st.session_state.detection_snapshots
                     )
 
                     st.session_state.saved_pdf = pdf_path
