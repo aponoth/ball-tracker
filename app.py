@@ -552,7 +552,6 @@ def generate_pdf_report(trajectories, ball_log, accuracy_data, filter_stats, wid
 
         # Bottom: 6 Snapshots in a 2x3 grid (occupies bottom ~45%)
         if snapshots:
-            st.write(f"Adding {len(snapshots)} snapshots to report...") # Debug
             for i, snap in enumerate(snapshots[:6]):
                 row = 1 - (i // 3)  # 0 or 1, inverted for bottom-up axes coords
                 col = i % 3         # 0, 1, or 2
@@ -1118,9 +1117,10 @@ if temp_path and not st.session_state.analysis_complete:
             start_pos = np.array(p[0])
             end_pos = np.array(p[-1])
             total_displacement = np.linalg.norm(end_pos - start_pos)
-            
-            # If the ball hasn't moved at least 50 pixels (or 3x its size), ignore it
-            if total_displacement < 50:
+
+            # Normalize minimum displacement to frame rate (50px at 30fps baseline)
+            min_displacement = 50 * (30 / video_fps)
+            if total_displacement < min_displacement:
                 return
 
             n = min(4, len(p))
@@ -1133,7 +1133,11 @@ if temp_path and not st.session_state.analysis_complete:
                 dy = np.mean([p[i+1][1] - p[i][1] for i in range(n - 1)])
                 if is_dtl:
                     # In DTL, use abs(dx) to show steepness regardless of horizontal side
-                    launch_angle = round(np.degrees(np.arctan2(-dy, abs(dx)+0.1)), 1)
+                    # Handle near-vertical trajectories without bias
+                    if abs(dx) < 0.1:
+                        launch_angle = 90.0 if dy < 0 else -90.0
+                    else:
+                        launch_angle = round(np.degrees(np.arctan2(-dy, abs(dx))), 1)
                 else:
                     launch_angle = round(np.degrees(np.arctan2(-dy, dx)), 1)
             else:
