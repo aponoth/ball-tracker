@@ -31,7 +31,7 @@ def reset_app_state(rerun=True):
         'active_tracks', 'pause_frame', 'paused', 'next_ball_id',
         'last_frame', 'launch_zone_center', 'launch_zone_radius',
         'analysis_complete', 'files_saved', 'saved_csv', 'saved_chart', 'saved_pdf',
-        'detection_snapshots'
+        'detection_snapshots', 'video_view_type'
     ]
     for key in keys_to_reset:
         if key in ['raw_trajectories', 'raw_ball_log', 'all_trajectories', 'ball_log', 'active_tracks', 'detection_snapshots']:
@@ -40,6 +40,8 @@ def reset_app_state(rerun=True):
             st.session_state[key] = 0 if key == 'pause_frame' else 1
         elif key in ['paused', 'analysis_complete', 'files_saved']:
             st.session_state[key] = False
+        elif key == 'video_view_type':
+            st.session_state[key] = "Side View"
         else:
             st.session_state[key] = None
     
@@ -50,6 +52,10 @@ def reset_app_state(rerun=True):
 
 st.sidebar.markdown("## 🎬 Phase 1: Detection")
 st.sidebar.caption("⚠️ Changes require 'Rerun Analysis' button")
+st.sidebar.divider()
+
+view_type = st.sidebar.radio("Camera View", ["Side View", "Down-the-Line (DTL)"], index=0, 
+                             help="Side View: Camera is perpendicular to the path. DTL: Camera is behind or in front of the trajectory.")
 st.sidebar.divider()
 
 sensitivity = st.sidebar.slider("Shape Sensitivity", 0.1, 1.0, 0.6, 0.05)
@@ -138,6 +144,8 @@ if 'saved_chart' not in st.session_state:
     st.session_state.saved_chart = None
 if 'saved_pdf' not in st.session_state:
     st.session_state.saved_pdf = None
+if 'video_view_type' not in st.session_state:
+    st.session_state.video_view_type = "Side View"
 if 'video_width' not in st.session_state:
     st.session_state.video_width = 1920
 if 'video_height' not in st.session_state:
@@ -531,9 +539,12 @@ def generate_pdf_report(trajectories, ball_log, accuracy_data, filter_stats, wid
 
         ax_traj.autoscale(enable=True, axis='both', tight=False)
         ax_traj.margins(0.05)
-        ax_traj.set_xlabel('X Position (px)', color='black', fontsize=10)
+        
+        view_label = st.session_state.get('video_view_type', 'Side View')
+        x_label = 'Lateral Position (px)' if view_label == 'Down-the-Line (DTL)' else 'X Position (px)'
+        ax_traj.set_xlabel(x_label, color='black', fontsize=10)
         ax_traj.set_ylabel('Y Position (px)', color='black', fontsize=10)
-        ax_traj.set_title('Ball Trajectories & Analysis Overview', color='black', fontsize=12, fontweight='bold')
+        ax_traj.set_title(f'Ball Trajectories & Analysis ({view_label})', color='black', fontsize=12, fontweight='bold')
         ax_traj.tick_params(colors='black', labelsize=8)
         for spine in ax_traj.spines.values():
             spine.set_color('#444')
@@ -567,6 +578,7 @@ def generate_pdf_report(trajectories, ball_log, accuracy_data, filter_stats, wid
 
         summary_text = f"Ball Tracking Analysis Report\n\n"
         summary_text += f"Total Balls Analyzed: {len(df)}\n"
+        summary_text += f"Camera View: {st.session_state.get('video_view_type', 'Side View')}\n"
         summary_text += f"Initial Detections: {filter_stats['initial']}\n"
         summary_text += f"Filtered Out: {filter_stats['spatial_removed']} spatial, "
         summary_text += f"{filter_stats['domain_removed']} domain, "
@@ -1023,6 +1035,12 @@ if temp_path and not st.session_state.analysis_complete:
         st.session_state.video_width = width
         st.session_state.video_height = height
         st.session_state.video_fps = video_fps
+        st.session_state.video_view_type = view_type
+
+        # Adjust tracking parameters based on view type
+        is_dtl = (view_type == "Down-the-Line (DTL)")
+        effective_match_threshold = match_threshold * (1.5 if is_dtl else 1.0)
+        effective_sensitivity = sensitivity * (0.8 if is_dtl else 1.0) # less strict circularity
 
         lower_yellow = np.array([20, sat_val, 100])
         upper_yellow = np.array([35, 255, 255])
@@ -1033,6 +1051,14 @@ if temp_path and not st.session_state.analysis_complete:
             if len(path) >= 2:
                 dx = path[-1][0] - path[-2][0]
                 dy = path[-1][1] - path[-2][1]
+                
+                # In DTL, pixel velocity changes as it moves away/towards center (depth)
+                if is_dtl:
+                    frame_center_y = height // 2
+                    if (path[-1][1] < frame_center_y and dy < 0) or (path[-1][1] > frame_center_y and dy > 0):
+                        dx *= 0.95
+                        dy *= 0.95
+
                 # Add gravity to vertical velocity (dy)
                 # Note: y coordinates are top-down, so gravity is positive.
                 return (path[-1][0] + dx, path[-1][1] + dy + GRAVITY_ACCEL)
@@ -1041,6 +1067,9 @@ if temp_path and not st.session_state.analysis_complete:
         def direction_ok(path, new_pos, max_angle=120):
             if len(path) < 2:
                 return True
+            # Relax direction constraints slightly for DTL
+            if is_dtl:
+                max_angle = 150
             vx = path[-1][0] - path[-2][0]
             vy = path[-1][1] - path[-2][1]
             dx = new_pos[0] - path[-1][0]
@@ -1088,7 +1117,11 @@ if temp_path and not st.session_state.analysis_complete:
             if len(p) >= 2:
                 dx = np.mean([p[i+1][0] - p[i][0] for i in range(n - 1)])
                 dy = np.mean([p[i+1][1] - p[i][1] for i in range(n - 1)])
-                launch_angle = round(np.degrees(np.arctan2(-dy, dx)), 1)
+                if is_dtl:
+                    # In DTL, use abs(dx) to show steepness regardless of horizontal side
+                    launch_angle = round(np.degrees(np.arctan2(-dy, abs(dx)+0.1)), 1)
+                else:
+                    launch_angle = round(np.degrees(np.arctan2(-dy, dx)), 1)
             else:
                 launch_angle = 0.0
             max_height_px = min(pt[1] for pt in p)
@@ -1100,6 +1133,7 @@ if temp_path and not st.session_state.analysis_complete:
                 "Initial Velocity (px/s)": round(init_vel, 1),
                 "Launch Angle (°)": launch_angle,
                 "Max Height (px from top)": max_height_px,
+                "View Type": view_type
             })
 
         # --- End helpers ---
@@ -1161,9 +1195,9 @@ if temp_path and not st.session_state.analysis_complete:
             for cnt in contours:
                 area = cv2.contourArea(cnt)
                 perimeter = cv2.arcLength(cnt, True)
-                if area > MIN_BALL_AREA and perimeter > 0:
+                if area > effective_min_ball_area and perimeter > 0:
                     circularity = 4 * np.pi * (area / (perimeter * perimeter))
-                    if circularity > sensitivity:
+                    if circularity > effective_sensitivity:
                         M = cv2.moments(cnt)
                         if M["m00"] != 0:
                             center = (int(M["m10"] / M["m00"]), int(M["m01"] / M["m00"]))
@@ -1175,7 +1209,7 @@ if temp_path and not st.session_state.analysis_complete:
             new_active = []
             for center in current_centers:
                 matched = False
-                best_dist = match_threshold
+                best_dist = effective_match_threshold
                 best_track = None
                 for track in active_tracks:
                     predicted = predict_pos(track['path'])
