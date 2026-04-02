@@ -1040,6 +1040,7 @@ if temp_path and not st.session_state.analysis_complete:
         # Adjust tracking parameters based on view type
         is_dtl = (view_type == "Down-the-Line (DTL)")
         effective_match_threshold = match_threshold * (1.5 if is_dtl else 1.0)
+        effective_min_ball_area = MIN_BALL_AREA * (0.5 if is_dtl else 1.0) # smaller blobs if far away
         effective_sensitivity = sensitivity * (0.8 if is_dtl else 1.0) # less strict circularity
 
         lower_yellow = np.array([20, sat_val, 100])
