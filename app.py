@@ -60,8 +60,6 @@ if 'saved_pdf' not in st.session_state:
     st.session_state.saved_pdf = None
 if 'target_height_pct' not in st.session_state:
     st.session_state.target_height_pct = 40.0
-if 'show_accuracy_modal' not in st.session_state:
-    st.session_state.show_accuracy_modal = False
 if 'video_view_type' not in st.session_state:
     st.session_state.video_view_type = "Side View"
 if 'video_width' not in st.session_state:
@@ -83,7 +81,7 @@ def reset_app_state(rerun=True):
         'active_tracks', 'pause_frame', 'paused', 'next_ball_id',
         'last_frame', 'launch_zone_center', 'launch_zone_radius',
         'analysis_complete', 'files_saved', 'saved_csv', 'saved_chart', 'saved_pdf',
-        'detection_snapshots', 'video_view_type'
+        'detection_snapshots', 'video_view_type', 'target_height_pct'
     ]
     for key in keys_to_reset:
         if key in ['raw_trajectories', 'raw_ball_log', 'all_trajectories', 'ball_log', 'active_tracks', 'detection_snapshots']:
@@ -94,6 +92,8 @@ def reset_app_state(rerun=True):
             st.session_state[key] = False
         elif key == 'video_view_type':
             st.session_state[key] = "Side View"
+        elif key == 'target_height_pct':
+            st.session_state[key] = 40.0
         else:
             st.session_state[key] = None
     
@@ -141,29 +141,20 @@ st.sidebar.markdown("**🎯 Target Accuracy**")
 enable_accuracy = st.sidebar.checkbox("Show Accuracy Analysis", value=True)
 
 if enable_accuracy:
-    def on_target_height_change():
-        st.session_state.show_accuracy_modal = True
-
     col_h1, col_h2 = st.sidebar.columns([2, 1])
+    # Use key-based state for automatic sync
     with col_h1:
-        target_height_pct = st.slider("Target Height (%)", 0.0, 100.0, 
-                                     key="target_height_slider",
-                                     value=st.session_state.target_height_pct,
-                                     step=0.1,
-                                     on_change=on_target_height_change)
+        st.slider("Target Height (%)", 0.0, 100.0, 
+                  key="target_height_pct",
+                  step=0.1)
     with col_h2:
-        target_height_pct = st.number_input("Value", 0.0, 100.0, 
-                                           key="target_height_number",
-                                           value=st.session_state.target_height_pct,
-                                           step=0.1,
-                                           label_visibility="collapsed",
-                                           on_change=on_target_height_change)
+        st.number_input("Value", 0.0, 100.0, 
+                        key="target_height_pct",
+                        step=0.1,
+                        label_visibility="collapsed")
     
-    st.session_state.target_height_pct = target_height_pct
+    target_height_pct = st.session_state.target_height_pct
     st.sidebar.caption(f"Landing accuracy at {target_height_pct}% height (descending only)")
-    
-    if st.sidebar.button("🔍 Open Large Chart View", use_container_width=True):
-        st.session_state.show_accuracy_modal = True
 else:
     target_height_pct = 40.0
 
@@ -1716,25 +1707,8 @@ if st.session_state.analysis_complete and st.session_state.raw_trajectories:
                 height
             )
 
-        # --- Modal/Large View Logic ---
-        if st.session_state.show_accuracy_modal and accuracy_data is not None:
-            @st.dialog("🎯 Detailed Target Accuracy Analysis", width="large")
-            def show_accuracy_dialog(acc_data):
-                render_accuracy_analysis(
-                    acc_data,
-                    st.session_state.all_trajectories,
-                    st.session_state.ball_log,
-                    st.session_state.target_height_pct,
-                    width,
-                    height
-                )
-                if st.button("Close"):
-                    st.session_state.show_accuracy_modal = False
-                    st.rerun()
-
-            show_accuracy_dialog(accuracy_data)
-
         render_trajectory_chart_unified(st.session_state.all_trajectories, [], st.session_state.ball_log, width, height, enable_accuracy, st.session_state.target_height_pct if enable_accuracy else 40)
+        
         df = pd.DataFrame(st.session_state.ball_log)
         df = df.sort_values("Launch Time (s)").reset_index(drop=True)
         df.insert(0, "Ball", range(1, len(df) + 1))
