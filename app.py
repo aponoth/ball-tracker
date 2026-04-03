@@ -87,9 +87,33 @@ st.sidebar.caption(f"Minimum: {min_velocity} px/s")
 
 st.sidebar.markdown("**🎯 Target Accuracy**")
 enable_accuracy = st.sidebar.checkbox("Show Accuracy Analysis", value=True)
-target_height_pct = st.sidebar.slider("Target Height (%)", 0, 100, 40, 5) if enable_accuracy else 40
+
 if enable_accuracy:
+    def on_target_height_change():
+        st.session_state.show_accuracy_modal = True
+
+    col_h1, col_h2 = st.sidebar.columns([2, 1])
+    with col_h1:
+        target_height_pct = st.slider("Target Height (%)", 0.0, 100.0, 
+                                     key="target_height_slider",
+                                     value=st.session_state.target_height_pct,
+                                     step=0.1,
+                                     on_change=on_target_height_change)
+    with col_h2:
+        target_height_pct = st.number_input("Value", 0.0, 100.0, 
+                                           key="target_height_number",
+                                           value=st.session_state.target_height_pct,
+                                           step=0.1,
+                                           label_visibility="collapsed",
+                                           on_change=on_target_height_change)
+    
+    st.session_state.target_height_pct = target_height_pct
     st.sidebar.caption(f"Landing accuracy at {target_height_pct}% height (descending only)")
+    
+    if st.sidebar.button("🔍 Open Large Chart View", use_container_width=True):
+        st.session_state.show_accuracy_modal = True
+else:
+    target_height_pct = 40.0
 
 st.sidebar.markdown("**📈 Statistical**")
 enable_stats_filtering = st.sidebar.checkbox("IQR Outlier Removal", value=False)
@@ -144,6 +168,10 @@ if 'saved_chart' not in st.session_state:
     st.session_state.saved_chart = None
 if 'saved_pdf' not in st.session_state:
     st.session_state.saved_pdf = None
+if 'target_height_pct' not in st.session_state:
+    st.session_state.target_height_pct = 40.0
+if 'show_accuracy_modal' not in st.session_state:
+    st.session_state.show_accuracy_modal = False
 if 'video_view_type' not in st.session_state:
     st.session_state.video_view_type = "Side View"
 if 'video_width' not in st.session_state:
@@ -777,10 +805,21 @@ def generate_pdf_report(trajectories, ball_log, accuracy_data, filter_stats, wid
                         
                         x_data = corr_df[col_name]
                         y_data = corr_df['Target X']
+                        # Map Ball # to sequential numbers for PDF labeling
+                        sorted_log_pdf = sorted(ball_log, key=lambda x: x['Launch Time (s)'])
+                        ball_id_to_seq_pdf = {entry['Ball #']: i + 1 for i, entry in enumerate(sorted_log_pdf)}
+                        ball_nums_pdf = [ball_id_to_seq_pdf.get(i['ball_id'], '?') for i in accuracy_data['intercepts']]
+                        
                         corr_val = correlations.get(metric_name, 0)
                         
                         ax.scatter(x_data, y_data, c=color, s=80, alpha=0.6, edgecolors='black', linewidth=0.5)
                         
+                        # Add ball number labels to scatter points in PDF
+                        for i, txt in enumerate(ball_nums_pdf):
+                            ax.annotate(str(txt), (x_data.iloc[i], y_data.iloc[i]), 
+                                        textcoords="offset points", xytext=(0, 5), 
+                                        ha='center', fontsize=6, color='black', alpha=0.7)
+
                         # Add trend line
                         if not np.isnan(corr_val) and abs(corr_val) > 0.01:
                             try:
@@ -837,6 +876,10 @@ def render_accuracy_analysis(accuracy_data, trajectories, ball_log, target_heigh
     ax_top.tick_params(colors='white')
     ax_top.spines[:].set_color('#444')
 
+    # Build seq map once
+    sorted_log = sorted(ball_log, key=lambda x: x['Launch Time (s)'])
+    ball_id_to_seq = {entry['Ball #']: i + 1 for i, entry in enumerate(sorted_log)}
+
     for track in trajectories:
         pts = np.array(track['path'])
         ax_top.plot(pts[:, 0], pts[:, 1], color=track['color'], linewidth=1, alpha=0.5)
@@ -844,6 +887,11 @@ def render_accuracy_analysis(accuracy_data, trajectories, ball_log, target_heigh
         # Mark peak (apex) of each trajectory
         peak_idx = np.argmin(pts[:, 1])  # Minimum Y = highest point
         ax_top.plot(pts[peak_idx, 0], pts[peak_idx, 1], 'x', color=track['color'], markersize=6, markeredgewidth=2)
+        
+        # Label with ball number
+        ball_num = ball_id_to_seq.get(track.get('id'), '?')
+        ax_top.text(pts[peak_idx, 0], pts[peak_idx, 1] - 10, str(ball_num), 
+                    color=track['color'], fontsize=8, fontweight='bold', ha='center')
 
     # Draw target line
     ax_top.axhline(target_y_px, color='red', linestyle='--', linewidth=2, label=f'Target @ {target_height_pct}%')
@@ -989,16 +1037,23 @@ def render_accuracy_analysis(accuracy_data, trajectories, ball_log, target_heigh
 
             for metric_name, col_name, ax, color, xlabel in metrics:
                 ax.set_facecolor('#1e1e1e')
-                ax.tick_params(colors='white')
+                ax.tick_params(colors='white', labelsize=8)
                 for spine in ax.spines.values():
                     spine.set_color('#444')
 
                 x_data = corr_df[col_name]
                 y_data = corr_df['Target X']
+                ball_nums_corr = [i['ball_num'] for i in accuracy['intercepts']]
                 corr_val = correlations.get(metric_name, 0)
 
                 # Scatter plot
                 ax.scatter(x_data, y_data, c=color, s=80, alpha=0.7, edgecolors='white', linewidth=1)
+                
+                # Add ball number labels to scatter points
+                for i, txt in enumerate(ball_nums_corr):
+                    ax.annotate(str(txt), (x_data.iloc[i], y_data.iloc[i]), 
+                                textcoords="offset points", xytext=(0, 5), 
+                                ha='center', fontsize=7, color='white', alpha=0.8)
 
                 # Add trend line if correlation is significant
                 if abs(corr_val) > 0.1:
@@ -1007,9 +1062,9 @@ def render_accuracy_analysis(accuracy_data, trajectories, ball_log, target_heigh
                     x_line = np.linspace(x_data.min(), x_data.max(), 100)
                     ax.plot(x_line, p(x_line), '--', color='red', linewidth=2, alpha=0.6)
 
-                ax.set_xlabel(xlabel, color='white', fontsize=9)
-                ax.set_ylabel('Target X (px)', color='white', fontsize=9)
-                ax.set_title(f'{metric_name}\nCorr: {corr_val:.3f}', color='white', fontsize=10, fontweight='bold')
+                ax.set_xlabel(xlabel, color='white', fontsize=8)
+                ax.set_ylabel('Target X (px)', color='white', fontsize=8)
+                ax.set_title(f'{metric_name}\nCorr: {corr_val:.3f}', color='white', fontsize=9, fontweight='bold')
                 ax.grid(True, alpha=0.2, color='white')
 
             fig_corr.tight_layout()
@@ -1653,7 +1708,7 @@ if st.session_state.analysis_complete and st.session_state.raw_trajectories:
         # Calculate accuracy data first (if enabled) so we can add columns to table
         accuracy_data = None
         if enable_accuracy and len(st.session_state.all_trajectories) >= 3:
-            target_y_px = int(height * target_height_pct / 100)
+            target_y_px = int(height * st.session_state.target_height_pct / 100)
             accuracy_data = calculate_target_accuracy(
                 st.session_state.all_trajectories,
                 st.session_state.ball_log,
@@ -1661,8 +1716,25 @@ if st.session_state.analysis_complete and st.session_state.raw_trajectories:
                 height
             )
 
-        render_trajectory_chart_unified(st.session_state.all_trajectories, [], st.session_state.ball_log, width, height, enable_accuracy, target_height_pct if enable_accuracy else 40)
+        # --- Modal/Large View Logic ---
+        if st.session_state.show_accuracy_modal and accuracy_data is not None:
+            @st.dialog("🎯 Detailed Target Accuracy Analysis", width="large")
+            def show_accuracy_dialog(acc_data):
+                render_accuracy_analysis(
+                    acc_data,
+                    st.session_state.all_trajectories,
+                    st.session_state.ball_log,
+                    st.session_state.target_height_pct,
+                    width,
+                    height
+                )
+                if st.button("Close"):
+                    st.session_state.show_accuracy_modal = False
+                    st.rerun()
 
+            show_accuracy_dialog(accuracy_data)
+
+        render_trajectory_chart_unified(st.session_state.all_trajectories, [], st.session_state.ball_log, width, height, enable_accuracy, st.session_state.target_height_pct if enable_accuracy else 40)
         df = pd.DataFrame(st.session_state.ball_log)
         df = df.sort_values("Launch Time (s)").reset_index(drop=True)
         df.insert(0, "Ball", range(1, len(df) + 1))
