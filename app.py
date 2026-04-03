@@ -448,6 +448,96 @@ def render_summary_unified(df, accuracy_data=None):
 
     log_table.dataframe(display_df, hide_index=True, use_container_width=True)
 
+def calculate_projected_accuracy(trajectories, ball_log, target_y_px, frame_height):
+    """Project trajectories using reliable early data (launch to apex) and physics.
+    
+    Fits a parabola using GRAVITY_ACCEL to predict landing position.
+    """
+    projected_intercepts = []
+    
+    # Create mapping of Ball # to sequential number
+    sorted_log = sorted(ball_log, key=lambda x: x['Launch Time (s)'])
+    ball_id_to_seq = {entry['Ball #']: i + 1 for i, entry in enumerate(sorted_log)}
+
+    for track, log_entry in zip(trajectories, ball_log):
+        path = track['path']
+        if len(path) < 5: continue
+        
+        ball_num = ball_id_to_seq.get(track['id'], '?')
+        pts = np.array(path)
+        
+        # 1. Identify Reliable Segment (Launch to Apex + 3 frames)
+        # Minimum Y is the apex
+        apex_idx = np.argmin(pts[:, 1])
+        # Use data from start up to slightly past apex
+        reliable_end = min(len(pts), apex_idx + 4)
+        reliable_pts = pts[:reliable_end]
+        
+        if len(reliable_pts) < 3: continue
+        
+        # 2. Physics Model Fitting
+        # y(t) = y0 + vy0*t + 0.5*g*t^2
+        # x(t) = x0 + vx*t
+        # We know g = GRAVITY_ACCEL. We solve for vx and vy0.
+        
+        # Time steps (frames)
+        t = np.arange(len(reliable_pts))
+        x = reliable_pts[:, 0]
+        y = reliable_pts[:, 1]
+        
+        # Fit X (linear)
+        vx_fit = np.polyfit(t, x, 1)[0]
+        x0_fit = x[0]
+        
+        # Fit Y (quadratic with fixed gravity)
+        # y - 0.5*g*t^2 = y0 + vy0*t
+        y_adj = y - 0.5 * GRAVITY_ACCEL * (t**2)
+        vy0_fit, y0_fit = np.polyfit(t, y_adj, 1)
+        
+        # 3. Project to Target Height
+        # Solve for t: 0.5*g*t^2 + vy0*t + (y0 - target_y) = 0
+        a = 0.5 * GRAVITY_ACCEL
+        b = vy0_fit
+        c = y0_fit - target_y_px
+        
+        discriminant = b**2 - 4*a*c
+        if discriminant >= 0:
+            # We want the positive root (descending)
+            t_intercept = (-b + np.sqrt(discriminant)) / (2*a)
+            
+            # Final projected X
+            x_projected = x0_fit + vx_fit * t_intercept
+            
+            projected_intercepts.append({
+                'ball_id': track['id'],
+                'ball_num': ball_num,
+                'x': x_projected,
+                'y': target_y_px,
+                'launch_time': log_entry['Launch Time (s)'],
+                'extrapolated': True,
+                'is_projection': True
+            })
+
+    if not projected_intercepts: return None
+
+    # Calculate metrics
+    x_positions = np.array([i['x'] for i in projected_intercepts])
+    mean_x = np.mean(x_positions)
+    std_x = np.std(x_positions)
+    distances_from_mean = np.abs(x_positions - mean_x)
+    
+    return {
+        'intercepts': projected_intercepts,
+        'mean_x': mean_x,
+        'std_x': std_x,
+        'cep': np.median(distances_from_mean),
+        'r95': np.percentile(distances_from_mean, 95),
+        'min_x': np.min(x_positions),
+        'max_x': np.max(x_positions),
+        'spread': np.max(x_positions) - np.min(x_positions),
+        'intercept_map': {i['ball_id']: {'target_x': i['x'], 'target_distance': abs(i['x'] - mean_x), 'extrapolated': True} for i in projected_intercepts}
+    }
+
 def calculate_target_accuracy(trajectories, ball_log, target_y_px, frame_height):
     """Calculate where each trajectory crosses a target height on DESCENDING path (or extrapolate).
 
@@ -868,30 +958,31 @@ def generate_pdf_report(trajectories, ball_log, accuracy_data, filter_stats, wid
         d['Subject'] = 'Trajectory Analysis and Accuracy Metrics'
         d['CreationDate'] = time.strftime('%Y%m%d%H%M%S')
 
-def render_accuracy_analysis(accuracy_data, trajectories, ball_log, target_height_pct, frame_width, frame_height):
+def render_accuracy_analysis(accuracy_data, trajectories, ball_log, target_height_pct, frame_width, frame_height, mode="Actual"):
     """Render target accuracy visualization using pre-calculated accuracy data."""
     if accuracy_data is None:
         target_y_px = int(frame_height * target_height_pct / 100)
-        st.warning(f"⚠️ No trajectories reach target height ({target_height_pct}% = {target_y_px}px from top)")
+        st.warning(f"⚠️ No valid {mode.lower()} data for target height ({target_height_pct}% = {target_y_px}px from top)")
         return
 
     accuracy = accuracy_data
     target_y_px = int(frame_height * target_height_pct / 100)
-    st.markdown("### 🎯 Target Accuracy Analysis")
+    st.markdown(f"### 🎯 Target Accuracy Analysis ({mode})")
 
     # Metrics
     col1, col2, col3, col4 = st.columns(4)
     with col1:
-        st.metric("Mean X Position", f"{accuracy['mean_x']:.0f} px")
+        st.metric(f"Mean X ({mode})", f"{accuracy['mean_x']:.0f} px")
     with col2:
-        st.metric("Spread (σ)", f"{accuracy['std_x']:.0f} px")
+        st.metric(f"Spread ({mode})", f"{accuracy['std_x']:.0f} px")
     with col3:
         st.metric("CEP (50%)", f"{accuracy['cep']:.0f} px")
     with col4:
         st.metric("R95 (95%)", f"{accuracy['r95']:.0f} px")
 
     # Visualization
-    st.caption("💡 **Tip**: Click anywhere on the top chart to set the target height interactively!")
+    if mode == "Actual":
+        st.caption("💡 **Tip**: Click anywhere on the top chart to set the target height interactively!")
     
     # 1. Plotly Interactive Chart (Top)
     fig_top = go.Figure()
@@ -924,7 +1015,7 @@ def render_accuracy_analysis(accuracy_data, trajectories, ball_log, target_heigh
         fig_top.add_trace(go.Scatter(
             x=pts[:, 0], y=pts[:, 1],
             mode='lines',
-            line=dict(color=color_hex, width=3.0),
+            line=dict(color=color_hex, width=3.0, dash='solid' if mode=="Actual" else 'dot'),
             hoverinfo='skip',
             showlegend=False
         ))
@@ -951,10 +1042,10 @@ def render_accuracy_analysis(accuracy_data, trajectories, ball_log, target_heigh
             mode='markers',
             marker=dict(
                 symbol='circle' if not is_extrap else 'circle-open',
-                color='yellow', size=10, 
-                line=dict(color='red', width=2)
+                color='yellow' if mode=="Actual" else '#00ff00', size=10, 
+                line=dict(color='red' if mode=="Actual" else '#00ff00', width=2)
             ),
-            name=f"Intercept {ball_num}",
+            name=f"{mode} Intercept {ball_num}",
             hoverinfo='name'
         ))
 
@@ -979,31 +1070,28 @@ def render_accuracy_analysis(accuracy_data, trajectories, ball_log, target_heigh
         yaxis=dict(title="Y Position (px)", gridcolor='#333', 
                    range=[st.session_state.chart_y_max, st.session_state.chart_y_min], 
                    autorange=False, fixedrange=True),
-        title=dict(text="Trajectories with Target Line (Click to adjust Target)", font=dict(size=14)),
+        title=dict(text=f"Trajectories ({mode})", font=dict(size=14)),
         showlegend=False,
         clickmode='event+select',
         dragmode=False
     )
 
-    # Render and capture clicks with a dynamic key to force update on axis change
-    plotly_key = f"accuracy_plotly_{st.session_state.chart_y_min}_{st.session_state.chart_y_max}"
+    # Render and capture clicks
+    plotly_key = f"accuracy_plotly_{mode}_{st.session_state.chart_y_min}_{st.session_state.chart_y_max}"
     event_data = st.plotly_chart(fig_top, use_container_width=True, on_select="rerun", key=plotly_key, config={'displayModeBar': False})
 
-    # Handle click interaction to set target height
-    if event_data and "selection" in event_data and event_data["selection"]["points"]:
+    # Handle click interaction to set target height (only in Actual mode)
+    if mode == "Actual" and event_data and "selection" in event_data and event_data["selection"]["points"]:
         points = event_data["selection"]["points"]
         new_y = points[0].get("y")
         if new_y is not None:
             new_pct = round((new_y / frame_height) * 100, 1)
-            # Bounds check
             new_pct = max(0.0, min(100.0, new_pct))
-            
-            # Update only if different to avoid infinite rerun loops
             if st.session_state.target_height_pct != new_pct:
                 st.session_state.target_height_pct = new_pct
                 st.rerun()
 
-    # Bottom Chart remains Matplotlib for now
+    # Bottom Chart remains Matplotlib
     fig_acc_bottom, ax_bottom = plt.subplots(figsize=(10, 3.5))
     fig_acc_bottom.patch.set_facecolor('#1e1e1e')
     ax_bottom.set_facecolor('#1e1e1e')
@@ -1015,34 +1103,22 @@ def render_accuracy_analysis(accuracy_data, trajectories, ball_log, target_heigh
     times = [i['launch_time'] for i in accuracy['intercepts']]
     extrapolated = [i.get('extrapolated', False) for i in accuracy['intercepts']]
 
-    # Scatter plot: X position vs time
-    extrap_labeled_scatter = False
-    actual_labeled_scatter = False
+    # Scatter plot
+    color_main = 'cyan' if mode=="Actual" else '#00ff00'
     for t, x, extrap in zip(times, x_positions, extrapolated):
-        if extrap:
-            label = 'Extrapolated' if not extrap_labeled_scatter else ''
-            ax_bottom.scatter(t, x, c='orange', s=100, alpha=0.7, edgecolors='white', marker='s', label=label)
-            extrap_labeled_scatter = True
-        else:
-            label = 'Actual' if not actual_labeled_scatter else ''
-            ax_bottom.scatter(t, x, c='cyan', s=100, alpha=0.7, edgecolors='white', marker='o', label=label)
-            actual_labeled_scatter = True
+        ax_bottom.scatter(t, x, c=color_main, s=100, alpha=0.7, edgecolors='white')
 
     # Label with ball numbers
-    for x, t, bn, extrap in zip(x_positions, times, ball_nums, extrapolated):
-        color = 'orange' if extrap else 'cyan'
-        ax_bottom.annotate(str(bn), (t, x), fontsize=8, color=color, ha='center', va='bottom')
+    for x, t, bn in zip(x_positions, times, ball_nums):
+        ax_bottom.annotate(str(bn), (t, x), fontsize=8, color=color_main, ha='center', va='bottom', xytext=(0,5), textcoords='offset points')
 
-    # Mean line and error bands
     ax_bottom.axhline(accuracy['mean_x'], color='green', linestyle='-', linewidth=2, label=f"Mean: {accuracy['mean_x']:.0f}px")
     ax_bottom.axhline(accuracy['mean_x'] + accuracy['std_x'], color='yellow', linestyle='--', linewidth=1, alpha=0.6, label=f'±1σ: {accuracy['std_x']:.0f}px')
     ax_bottom.axhline(accuracy['mean_x'] - accuracy['std_x'], color='yellow', linestyle='--', linewidth=1, alpha=0.6)
-    ax_bottom.axhline(accuracy['mean_x'] + 2*accuracy['std_x'], color='orange', linestyle=':', linewidth=1, alpha=0.4, label=f'±2σ')
-    ax_bottom.axhline(accuracy['mean_x'] - 2*accuracy['std_x'], color='orange', linestyle=':', linewidth=1, alpha=0.4)
 
     ax_bottom.set_xlabel('Launch Time (s)', color='white')
-    ax_bottom.set_ylabel('X Position at Target (px)', color='white')
-    ax_bottom.set_title(f'Landing Accuracy at {target_height_pct}% Height (Spread: {accuracy["spread"]:.0f}px)', color='white')
+    ax_bottom.set_ylabel(f'X Position ({mode})', color='white')
+    ax_bottom.set_title(f'{mode} Accuracy Distribution (Spread: {accuracy["spread"]:.0f}px)', color='white')
     ax_bottom.legend(facecolor='#1e1e1e', edgecolor='#444', labelcolor='white', loc='best')
     ax_bottom.grid(True, alpha=0.2, color='white')
 
@@ -1050,29 +1126,14 @@ def render_accuracy_analysis(accuracy_data, trajectories, ball_log, target_heigh
     st.pyplot(fig_acc_bottom)
     plt.close(fig_acc_bottom)
 
-    # Accuracy summary text
-    num_extrapolated = sum(1 for i in accuracy['intercepts'] if i.get('extrapolated', False))
-    num_actual = len(accuracy['intercepts']) - num_extrapolated
-
-    summary_text = f"**Analysis**: At {target_height_pct}% height ({target_y_px}px from top), shots have a mean position of {accuracy['mean_x']:.0f}px with {accuracy['std_x']:.0f}px spread. "
-    summary_text += f"50% of shots land within {accuracy['cep']:.0f}px of center, 95% within {accuracy['r95']:.0f}px. "
-
-    if num_extrapolated > 0:
-        summary_text += f"({num_actual} actual intercepts, {num_extrapolated} extrapolated)"
-    else:
-        summary_text += f"(All {num_actual} intercepts measured directly)"
-
-    st.caption(summary_text)
-
-    # Correlation analysis
+    # Correlation analysis (Keep for both)
     if len(accuracy['intercepts']) >= 3:
-        st.markdown("#### 📊 Correlation Analysis")
-
+        st.markdown(f"#### 📊 Correlation Analysis ({mode})")
+        
         # Build correlation dataframe
         corr_data = []
         for intercept in accuracy['intercepts']:
             ball_id = intercept['ball_id']
-            # Find corresponding log entry
             for log_entry in ball_log:
                 if log_entry['Ball #'] == ball_id:
                     corr_data.append({
@@ -1088,67 +1149,39 @@ def render_accuracy_analysis(accuracy_data, trajectories, ball_log, target_heigh
             corr_df = pd.DataFrame(corr_data)
             correlations = corr_df.corr()['Target X'].drop('Target X').sort_values(ascending=False)
 
-            st.caption("**Correlation with Target X (landing position):**")
             col_corr1, col_corr2, col_corr3, col_corr4 = st.columns(4)
-
-            with col_corr1:
-                val = correlations.get('Velocity', 0)
-                st.metric("Velocity", f"{val:.3f}", help="Positive = higher velocity → lands further right")
-            with col_corr2:
-                val = correlations.get('Angle', 0)
-                st.metric("Launch Angle", f"{val:.3f}", help="Positive = steeper angle → lands further right")
-            with col_corr3:
-                val = correlations.get('Max Height', 0)
-                st.metric("Max Height", f"{val:.3f}", help="Positive = higher peak → lands further right")
-            with col_corr4:
-                val = correlations.get('Launch Time', 0)
-                st.metric("Launch Time", f"{val:.3f}", help="Positive = later shots → lands further right")
-
-            st.caption("*Correlation ranges from -1 (strong negative) to +1 (strong positive). Values near 0 indicate weak correlation.*")
+            with col_corr1: st.metric("Velocity", f"{correlations.get('Velocity', 0):.3f}")
+            with col_corr2: st.metric("Angle", f"{correlations.get('Angle', 0):.3f}")
+            with col_corr3: st.metric("Max Height", f"{correlations.get('Max Height', 0):.3f}")
+            with col_corr4: st.metric("Launch Time", f"{correlations.get('Launch Time', 0):.3f}")
 
             # Correlation scatter plots
             fig_corr, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(12, 8))
             fig_corr.patch.set_facecolor('#1e1e1e')
-
             metrics = [
                 ('Velocity', 'Velocity', ax1, '#00bfff', 'Initial Velocity (px/s)'),
                 ('Angle', 'Angle', ax2, '#ff7f0e', 'Launch Angle (°)'),
                 ('Max Height', 'Max Height', ax3, '#2ecc71', 'Max Height (px from top)'),
                 ('Launch Time', 'Launch Time', ax4, '#9467bd', 'Launch Time (s)')
             ]
-
             for metric_name, col_name, ax, color, xlabel in metrics:
                 ax.set_facecolor('#1e1e1e')
                 ax.tick_params(colors='white', labelsize=8)
-                for spine in ax.spines.values():
-                    spine.set_color('#444')
-
-                x_data = corr_df[col_name]
-                y_data = corr_df['Target X']
+                for spine in ax.spines.values(): spine.set_color('#444')
+                x_data, y_data = corr_df[col_name], corr_df['Target X']
                 ball_nums_corr = [i['ball_num'] for i in accuracy['intercepts']]
                 corr_val = correlations.get(metric_name, 0)
-
-                # Scatter plot
                 ax.scatter(x_data, y_data, c=color, s=80, alpha=0.7, edgecolors='white', linewidth=1)
-                
-                # Add ball number labels to scatter points
                 for i, txt in enumerate(ball_nums_corr):
-                    ax.annotate(str(txt), (x_data.iloc[i], y_data.iloc[i]), 
-                                textcoords="offset points", xytext=(0, 5), 
-                                ha='center', fontsize=7, color='white', alpha=0.8)
-
-                # Add trend line if correlation is significant
+                    ax.annotate(str(txt), (x_data.iloc[i], y_data.iloc[i]), textcoords="offset points", xytext=(0, 5), ha='center', fontsize=7, color='white', alpha=0.8)
                 if abs(corr_val) > 0.1:
                     z = np.polyfit(x_data, y_data, 1)
                     p = np.poly1d(z)
-                    x_line = np.linspace(x_data.min(), x_data.max(), 100)
-                    ax.plot(x_line, p(x_line), '--', color='red', linewidth=2, alpha=0.6)
-
+                    ax.plot(np.linspace(x_data.min(), x_data.max(), 100), p(np.linspace(x_data.min(), x_data.max(), 100)), '--', color='red', linewidth=2, alpha=0.6)
                 ax.set_xlabel(xlabel, color='white', fontsize=8)
                 ax.set_ylabel('Target X (px)', color='white', fontsize=8)
-                ax.set_title(f'{metric_name}\nCorr: {corr_val:.3f}', color='white', fontsize=9, fontweight='bold')
+                ax.set_title(f'{metric_name} Corr: {corr_val:.3f}', color='white', fontsize=9, fontweight='bold')
                 ax.grid(True, alpha=0.2, color='white')
-
             fig_corr.tight_layout()
             st.pyplot(fig_corr)
             plt.close(fig_corr)
@@ -1789,6 +1822,7 @@ if st.session_state.analysis_complete and st.session_state.raw_trajectories:
 
         # Calculate accuracy data first (if enabled) so we can add columns to table
         accuracy_data = None
+        projected_data = None
         if enable_accuracy and len(st.session_state.all_trajectories) >= 3:
             target_y_px = int(height * st.session_state.target_height_pct / 100)
             accuracy_data = calculate_target_accuracy(
@@ -1797,9 +1831,16 @@ if st.session_state.analysis_complete and st.session_state.raw_trajectories:
                 target_y_px,
                 height
             )
+            # New: Calculate Projected Accuracy using early data + physics
+            projected_data = calculate_projected_accuracy(
+                st.session_state.all_trajectories,
+                st.session_state.ball_log,
+                target_y_px,
+                height
+            )
 
         render_trajectory_chart_unified(st.session_state.all_trajectories, [], st.session_state.ball_log, width, height, enable_accuracy, st.session_state.target_height_pct if enable_accuracy else 40)
-        
+
         df = pd.DataFrame(st.session_state.ball_log)
         df = df.sort_values("Launch Time (s)").reset_index(drop=True)
         df.insert(0, "Ball", range(1, len(df) + 1))
@@ -1807,16 +1848,38 @@ if st.session_state.analysis_complete and st.session_state.raw_trajectories:
         render_summary_unified(df, accuracy_data)
 
         # Target accuracy visualization
-        if enable_accuracy and accuracy_data is not None:
-            render_accuracy_analysis(
-                accuracy_data,
-                st.session_state.all_trajectories,
-                st.session_state.ball_log,
-                target_height_pct,
-                width,
-                height
-            )
+        if enable_accuracy and (accuracy_data is not None or projected_data is not None):
+            st.divider()
+            tab_actual, tab_projected = st.tabs(["📊 Actual Trajectories", "🔮 Projected (Physics Fit)"])
 
+            with tab_actual:
+                if accuracy_data:
+                    render_accuracy_analysis(
+                        accuracy_data,
+                        st.session_state.all_trajectories,
+                        st.session_state.ball_log,
+                        st.session_state.target_height_pct,
+                        width,
+                        height,
+                        mode="Actual"
+                    )
+                else:
+                    st.info("No trajectories reached the target height directly.")
+
+            with tab_projected:
+                if projected_data:
+                    st.info("💡 **How it works**: This uses early flight data (launch to apex) to fit a parabolic path. It filters out deviations caused by collisions with the target.")
+                    render_accuracy_analysis(
+                        projected_data,
+                        st.session_state.all_trajectories,
+                        st.session_state.ball_log,
+                        st.session_state.target_height_pct,
+                        width,
+                        height,
+                        mode="Projected"
+                    )
+                else:
+                    st.warning("Could not calculate physics-based projection for these trajectories.")
         # Summary and save buttons
         initial_count = len(st.session_state.raw_trajectories)
         final_count = len(st.session_state.all_trajectories)
