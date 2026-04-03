@@ -549,6 +549,11 @@ def calculate_target_accuracy(trajectories, ball_log, target_y_px, frame_height)
     sorted_log = sorted(ball_log, key=lambda x: x['Launch Time (s)'])
     ball_id_to_seq = {entry['Ball #']: i + 1 for i, entry in enumerate(sorted_log)}
 
+    # Safety check: ensure trajectories and ball_log are synchronized
+    if len(trajectories) != len(ball_log):
+        st.warning(f"⚠️ Data mismatch: {len(trajectories)} trajectories but {len(ball_log)} log entries")
+        return None
+
     for track, log_entry in zip(trajectories, ball_log):
         path = track['path']
         ball_num = ball_id_to_seq.get(track['id'], '?')
@@ -557,6 +562,8 @@ def calculate_target_accuracy(trajectories, ball_log, target_y_px, frame_height)
         if len(path) < 2:
             continue  # Skip invalid trajectories
         y_values = [pt[1] for pt in path]
+        if not y_values:  # Safety check for empty list
+            continue
         peak_idx = y_values.index(min(y_values))
 
         # Look for intercept AFTER peak (descending portion)
@@ -613,6 +620,12 @@ def calculate_target_accuracy(trajectories, ball_log, target_y_px, frame_height)
 
     # Calculate accuracy metrics
     x_positions = np.array([i['x'] for i in intercepts])
+
+    # Check for NaN values in positions
+    if np.any(np.isnan(x_positions)):
+        st.warning("⚠️ Invalid intercept calculations (NaN values detected)")
+        return None
+
     mean_x = np.mean(x_positions)
     std_x = np.std(x_positions)
 
@@ -645,8 +658,10 @@ def calculate_target_accuracy(trajectories, ball_log, target_y_px, frame_height)
         'intercept_map': intercept_map
     }
 
-def generate_pdf_report(trajectories, ball_log, accuracy_data, filter_stats, width, height, target_height_pct, output_path, snapshots=[]):
+def generate_pdf_report(trajectories, ball_log, accuracy_data, filter_stats, width, height, target_height_pct, output_path, snapshots=None):
     """Generate comprehensive PDF report with all visualizations and statistics."""
+    if snapshots is None:
+        snapshots = []
     with PdfPages(output_path) as pdf:
         # Page 1: Detection Overview (Chart + Snapshots)
         fig_overview = plt.figure(figsize=(11, 8.5))
@@ -1174,10 +1189,14 @@ def render_accuracy_analysis(accuracy_data, trajectories, ball_log, target_heigh
                 ax.scatter(x_data, y_data, c=color, s=80, alpha=0.7, edgecolors='white', linewidth=1)
                 for i, txt in enumerate(ball_nums_corr):
                     ax.annotate(str(txt), (x_data.iloc[i], y_data.iloc[i]), textcoords="offset points", xytext=(0, 5), ha='center', fontsize=7, color='white', alpha=0.8)
-                if abs(corr_val) > 0.1:
-                    z = np.polyfit(x_data, y_data, 1)
-                    p = np.poly1d(z)
-                    ax.plot(np.linspace(x_data.min(), x_data.max(), 100), p(np.linspace(x_data.min(), x_data.max(), 100)), '--', color='red', linewidth=2, alpha=0.6)
+                if abs(corr_val) > 0.1 and len(x_data) >= 2:
+                    try:
+                        z = np.polyfit(x_data, y_data, 1)
+                        p = np.poly1d(z)
+                        ax.plot(np.linspace(x_data.min(), x_data.max(), 100), p(np.linspace(x_data.min(), x_data.max(), 100)), '--', color='red', linewidth=2, alpha=0.6)
+                    except (np.linalg.LinAlgError, ValueError):
+                        # Polyfit can fail with singular matrices or insufficient data
+                        pass
                 ax.set_xlabel(xlabel, color='white', fontsize=8)
                 ax.set_ylabel('Target X (px)', color='white', fontsize=8)
                 ax.set_title(f'{metric_name} Corr: {corr_val:.3f}', color='white', fontsize=9, fontweight='bold')
@@ -1194,11 +1213,14 @@ if temp_path and not st.session_state.analysis_complete:
     
     if not cap.isOpened():
         st.error("Failed to open video file.")
+        st.stop()
     else:
         width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         video_fps = cap.get(cv2.CAP_PROP_FPS) if auto_fps else manual_fps
-        if video_fps <= 0: video_fps = 30
+        if video_fps <= 0:
+            st.warning("⚠️ Video FPS not detected, assuming 30 fps")
+            video_fps = 30
 
         # Store video properties for Phase 2 rendering
         st.session_state.video_width = width
@@ -1246,9 +1268,17 @@ if temp_path and not st.session_state.analysis_complete:
             vy = path[-1][1] - path[-2][1]
             dx = new_pos[0] - path[-1][0]
             dy = new_pos[1] - path[-1][1]
+
+            # Check for zero vectors first
             if (vx == 0 and vy == 0) or (dx == 0 and dy == 0):
                 return True
-            cos_a = (vx*dx + vy*dy) / ((vx**2+vy**2)**0.5 * (dx**2+dy**2)**0.5)
+
+            # Calculate denominator safely to avoid division by zero
+            denom = ((vx**2 + vy**2)**0.5 * (dx**2 + dy**2)**0.5)
+            if denom < 1e-6:  # Numerical stability threshold
+                return True
+
+            cos_a = (vx*dx + vy*dy) / denom
             return np.degrees(np.arccos(np.clip(cos_a, -1, 1))) < max_angle
 
         def has_bounced(path, consistent_frames=3, min_speed=2):
@@ -1281,7 +1311,11 @@ if temp_path and not st.session_state.analysis_complete:
         def finalize(track):
             """Finalize a track and store in RAW data (Phase 1)"""
             p = track['path']
-            
+
+            # Early exit for empty or invalid paths
+            if not p or len(p) < 2:
+                return
+
             # Displacement Filter: Ignore "tracks" that haven't moved significantly
             # especially important for DTL where stationary balls on robot are detected
             start_pos = np.array(p[0])
@@ -1298,6 +1332,7 @@ if temp_path and not st.session_state.analysis_complete:
                 np.linalg.norm(np.array(p[i+1]) - np.array(p[i])) * video_fps
                 for i in range(n - 1)
             ) / (n - 1) if n > 1 else 0
+            init_vel = float(init_vel)  # Ensure Python float for JSON serialization
             if len(p) >= 2:
                 dx = np.mean([p[i+1][0] - p[i][0] for i in range(n - 1)])
                 dy = np.mean([p[i+1][1] - p[i][1] for i in range(n - 1)])
@@ -1307,9 +1342,9 @@ if temp_path and not st.session_state.analysis_complete:
                     if abs(dx) < 0.1:
                         launch_angle = 90.0 if dy < 0 else -90.0
                     else:
-                        launch_angle = round(np.degrees(np.arctan2(-dy, abs(dx))), 1)
+                        launch_angle = float(round(np.degrees(np.arctan2(-dy, abs(dx))), 1))
                 else:
-                    launch_angle = round(np.degrees(np.arctan2(-dy, dx)), 1)
+                    launch_angle = float(round(np.degrees(np.arctan2(-dy, dx)), 1))
             else:
                 launch_angle = 0.0
             max_height_px = min(pt[1] for pt in p)
@@ -1377,7 +1412,9 @@ if temp_path and not st.session_state.analysis_complete:
             hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
             mask = cv2.inRange(hsv, lower_yellow, upper_yellow)
             mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((5,5), np.uint8))
-            contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            # OpenCV version compatibility: cv2.findContours returns different number of values in v3 vs v4
+            contour_result = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            contours = contour_result[-2]  # Works for both OpenCV 3.x and 4.x
 
             current_centers = []
             for cnt in contours:
@@ -1577,9 +1614,13 @@ def apply_filters(raw_trajectories, raw_ball_log, launch_time_pct, enable_stats,
             base_radius = np.median(distances_from_center) if len(distances_from_center) > 1 else distances_from_center[0]
             launch_radius = max(base_radius * SPATIAL_FILTER_MULTIPLIER, MIN_LAUNCH_ZONE_RADIUS)
             launch_radius = min(launch_radius, MAX_LAUNCH_ZONE_RADIUS)
-        else:
+        elif len(start_positions) > 0:
+            # Fallback: use median of all positions with fixed radius
             launch_center = np.median(start_positions, axis=0)
             launch_radius = 100
+        else:
+            # Edge case: no trajectories to filter
+            return [], [], None, None, filter_stats
 
         distances = np.sqrt(np.sum((start_positions - launch_center)**2, axis=1))
 
@@ -1953,14 +1994,19 @@ if st.session_state.analysis_complete and st.session_state.raw_trajectories:
                     video_name = st.session_state.original_filename
                     pdf_path = os.path.join(video_dir, f"ball_report_{video_name}_{timestamp}.pdf")
 
+                    # Ensure variables are defined (use None/defaults if not available)
+                    pdf_accuracy_data = accuracy_data if 'accuracy_data' in locals() else None
+                    pdf_filter_stats = filter_stats if 'filter_stats' in locals() else {}
+                    pdf_target_height = st.session_state.target_height_pct
+
                     generate_pdf_report(
                         st.session_state.all_trajectories,
                         st.session_state.ball_log,
-                        accuracy_data,
-                        filter_stats,
+                        pdf_accuracy_data,
+                        pdf_filter_stats,
                         width,
                         height,
-                        target_height_pct,
+                        pdf_target_height,
                         pdf_path,
                         st.session_state.detection_snapshots
                     )
