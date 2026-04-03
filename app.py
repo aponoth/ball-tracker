@@ -7,6 +7,7 @@ from matplotlib.backends.backend_pdf import PdfPages
 import time
 import pandas as pd
 import os
+import plotly.graph_objects as go
 
 # Constants
 MIN_BALL_AREA = 100  # minimum contour area in pixels
@@ -869,62 +870,112 @@ def render_accuracy_analysis(accuracy_data, trajectories, ball_log, target_heigh
         st.metric("R95 (95%)", f"{accuracy['r95']:.0f} px")
 
     # Visualization
-    fig_acc, (ax_top, ax_bottom) = plt.subplots(2, 1, figsize=(10, 6))
-    fig_acc.patch.set_facecolor('#1e1e1e')
+    st.caption("💡 **Tip**: Click anywhere on the top chart to set the target height interactively!")
+    
+    # 1. Plotly Interactive Chart (Top)
+    fig_top = go.Figure()
+    
+    # Invisible background to capture clicks anywhere
+    fig_top.add_trace(go.Scatter(
+        x=[0, frame_width, frame_width, 0],
+        y=[0, 0, frame_height, frame_height],
+        fill="toself",
+        fillcolor="rgba(0,0,0,0)",
+        line=dict(color="rgba(0,0,0,0)"),
+        hoverinfo='none',
+        showlegend=False,
+        name="bg_click_capture"
+    ))
 
-    # Top: Trajectory chart with target line
-    ax_top.set_facecolor('#1e1e1e')
-    ax_top.tick_params(colors='white')
-    ax_top.spines[:].set_color('#444')
-
-    # Build seq map once
+    # Build seq map for labels
     sorted_log = sorted(ball_log, key=lambda x: x['Launch Time (s)'])
     ball_id_to_seq = {entry['Ball #']: i + 1 for i, entry in enumerate(sorted_log)}
 
     for track in trajectories:
         pts = np.array(track['path'])
-        ax_top.plot(pts[:, 0], pts[:, 1], color=track['color'], linewidth=1, alpha=0.5)
-
-        # Mark peak (apex) of each trajectory
-        peak_idx = np.argmin(pts[:, 1])  # Minimum Y = highest point
-        ax_top.plot(pts[peak_idx, 0], pts[peak_idx, 1], 'x', color=track['color'], markersize=6, markeredgewidth=2)
-        
-        # Label with ball number
         ball_num = ball_id_to_seq.get(track.get('id'), '?')
-        ax_top.text(pts[peak_idx, 0], pts[peak_idx, 1] - 10, str(ball_num), 
-                    color=track['color'], fontsize=8, fontweight='bold', ha='center')
+        color_hex = '#%02x%02x%02x' % (int(track['color'][0]*255), int(track['color'][1]*255), int(track['color'][2]*255))
+        
+        # Path trace
+        fig_top.add_trace(go.Scatter(
+            x=pts[:, 0], y=pts[:, 1],
+            mode='lines',
+            line=dict(color=color_hex, width=1.5),
+            hoverinfo='skip',
+            showlegend=False
+        ))
 
-    # Draw target line
-    ax_top.axhline(target_y_px, color='red', linestyle='--', linewidth=2, label=f'Target @ {target_height_pct}%')
+        # Peak (Apex) marker and label
+        peak_idx = np.argmin(pts[:, 1])
+        fig_top.add_trace(go.Scatter(
+            x=[pts[peak_idx, 0]], y=[pts[peak_idx, 1]],
+            mode='markers+text',
+            marker=dict(symbol='x', color=color_hex, size=8),
+            text=[str(ball_num)],
+            textposition="top center",
+            textfont=dict(color=color_hex, size=10),
+            name=f"Ball {ball_num}",
+            hoverinfo='text'
+        ))
 
-    # Mark intercepts (different style for extrapolated vs actual)
-    extrapolated_labeled = False
-    actual_labeled = False
+    # Intercepts
     for intercept in accuracy['intercepts']:
-        if intercept.get('extrapolated', False):
-            # Hollow circle for extrapolated
-            label = 'Extrapolated' if not extrapolated_labeled else ''
-            ax_top.plot(intercept['x'], intercept['y'], 'o', color='none', markersize=10,
-                       markeredgecolor='orange', markeredgewidth=2, label=label)
-            extrapolated_labeled = True
-        else:
-            # Filled circle for actual intercepts
-            label = 'Actual' if not actual_labeled else ''
-            ax_top.plot(intercept['x'], intercept['y'], 'o', color='yellow', markersize=8,
-                       markeredgecolor='red', markeredgewidth=2, label=label)
-            actual_labeled = True
+        ball_num = intercept['ball_num']
+        is_extrap = intercept.get('extrapolated', False)
+        fig_top.add_trace(go.Scatter(
+            x=[intercept['x']], y=[intercept['y']],
+            mode='markers',
+            marker=dict(
+                symbol='circle' if not is_extrap else 'circle-open',
+                color='yellow', size=10, 
+                line=dict(color='red', width=2)
+            ),
+            name=f"Intercept {ball_num}",
+            hoverinfo='name'
+        ))
 
-    # Autoscale x-axis to zoom into trajectory region, keep full y-axis for context
-    ax_top.autoscale(enable=True, axis='x', tight=False)
-    ax_top.margins(x=0.1, y=0)  # 10% padding on x-axis, no padding on y
-    ax_top.set_ylim(frame_height, 0)  # Keep full Y range (normal image coordinates)
-    ax_top.set_xlabel('X Position (px)', color='white')
-    ax_top.set_ylabel('Y Position (px)', color='white')
-    ax_top.set_title('Trajectories with Target Line (X = apex, circles = descending intercept)', color='white', fontsize=9)
-    ax_top.legend(facecolor='#1e1e1e', edgecolor='#444', labelcolor='white')
-    ax_top.grid(True, alpha=0.2, color='white')
+    # Target line (Red Dashed)
+    fig_top.add_shape(
+        type="line", x0=0, x1=frame_width, y0=target_y_px, y1=target_y_px,
+        line=dict(color="Red", width=2, dash="dash")
+    )
+    fig_top.add_annotation(
+        x=frame_width*0.05, y=target_y_px,
+        text=f"Target @ {target_height_pct:.1f}%",
+        showarrow=False, yshift=10, font=dict(color="Red", size=12)
+    )
 
-    # Bottom: Accuracy distribution at target height
+    fig_top.update_layout(
+        template="plotly_dark",
+        paper_bgcolor='rgba(0,0,0,0)',
+        plot_bgcolor='#1e1e1e',
+        margin=dict(l=10, r=10, t=40, b=10),
+        height=400,
+        xaxis=dict(title="X Position (px)", gridcolor='#333'),
+        yaxis=dict(title="Y Position (px)", gridcolor='#333', range=[frame_height, 0], autorange=False),
+        title=dict(text="Trajectories with Target Line (Interactive)", font=dict(size=14)),
+        showlegend=False,
+        clickmode='event+select'
+    )
+
+    # Render and capture clicks
+    event_data = st.plotly_chart(fig_top, use_container_width=True, on_select="rerun", key="accuracy_plotly")
+
+    # Handle click interaction to set target height
+    if event_data and "selection" in event_data and "points" in event_data["selection"]:
+        points = event_data["selection"]["points"]
+        if len(points) > 0:
+            new_y = points[0].get("y")
+            if new_y is not None:
+                new_pct = round((new_y / frame_height) * 100, 1)
+                # Bounds check
+                new_pct = max(0.0, min(100.0, new_pct))
+                st.session_state.target_height_pct = new_pct
+                st.rerun()
+
+    # Bottom Chart remains Matplotlib for now
+    fig_acc_bottom, ax_bottom = plt.subplots(figsize=(10, 3.5))
+    fig_acc_bottom.patch.set_facecolor('#1e1e1e')
     ax_bottom.set_facecolor('#1e1e1e')
     ax_bottom.tick_params(colors='white')
     ax_bottom.spines[:].set_color('#444')
@@ -934,7 +985,7 @@ def render_accuracy_analysis(accuracy_data, trajectories, ball_log, target_heigh
     times = [i['launch_time'] for i in accuracy['intercepts']]
     extrapolated = [i.get('extrapolated', False) for i in accuracy['intercepts']]
 
-    # Scatter plot: X position vs time (different colors for actual vs extrapolated)
+    # Scatter plot: X position vs time
     extrap_labeled_scatter = False
     actual_labeled_scatter = False
     for t, x, extrap in zip(times, x_positions, extrapolated):
@@ -961,13 +1012,13 @@ def render_accuracy_analysis(accuracy_data, trajectories, ball_log, target_heigh
 
     ax_bottom.set_xlabel('Launch Time (s)', color='white')
     ax_bottom.set_ylabel('X Position at Target (px)', color='white')
-    ax_bottom.set_title(f'Landing Accuracy at {target_height_pct}% Height - Descending Only (Spread: {accuracy["spread"]:.0f}px)', color='white')
+    ax_bottom.set_title(f'Landing Accuracy at {target_height_pct}% Height (Spread: {accuracy["spread"]:.0f}px)', color='white')
     ax_bottom.legend(facecolor='#1e1e1e', edgecolor='#444', labelcolor='white', loc='best')
     ax_bottom.grid(True, alpha=0.2, color='white')
 
-    fig_acc.tight_layout()
-    st.pyplot(fig_acc)
-    plt.close(fig_acc)
+    fig_acc_bottom.tight_layout()
+    st.pyplot(fig_acc_bottom)
+    plt.close(fig_acc_bottom)
 
     # Accuracy summary text
     num_extrapolated = sum(1 for i in accuracy['intercepts'] if i.get('extrapolated', False))
