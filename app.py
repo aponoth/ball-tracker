@@ -141,17 +141,27 @@ st.sidebar.markdown("**🎯 Target Accuracy**")
 enable_accuracy = st.sidebar.checkbox("Show Accuracy Analysis", value=True)
 
 if enable_accuracy:
+    # --- Bidirectional Sync Logic ---
+    def on_slider_change():
+        st.session_state.target_height_pct = st.session_state.target_height_slider
+    
+    def on_number_change():
+        st.session_state.target_height_pct = st.session_state.target_height_number
+
     col_h1, col_h2 = st.sidebar.columns([2, 1])
-    # Use key-based state for automatic sync
     with col_h1:
         st.slider("Target Height (%)", 0.0, 100.0, 
-                  key="target_height_pct",
-                  step=0.1)
+                  key="target_height_slider",
+                  value=st.session_state.target_height_pct,
+                  step=0.1,
+                  on_change=on_slider_change)
     with col_h2:
         st.number_input("Value", 0.0, 100.0, 
-                        key="target_height_pct",
+                        key="target_height_number",
+                        value=st.session_state.target_height_pct,
                         step=0.1,
-                        label_visibility="collapsed")
+                        label_visibility="collapsed",
+                        on_change=on_number_change)
     
     target_height_pct = st.session_state.target_height_pct
     st.sidebar.caption(f"Landing accuracy at {target_height_pct}% height (descending only)")
