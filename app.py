@@ -985,18 +985,20 @@ def render_accuracy_analysis(accuracy_data, trajectories, ball_log, target_heigh
         dragmode=False
     )
 
-    # Render and capture clicks
-    event_data = st.plotly_chart(fig_top, use_container_width=True, on_select="rerun", key="accuracy_plotly", config={'displayModeBar': False})
+    # Render and capture clicks with a more stable selection mode
+    event_data = st.plotly_chart(fig_top, use_container_width=True, selection_mode="points", key="accuracy_plotly", config={'displayModeBar': False})
 
     # Handle click interaction to set target height
-    if event_data and "selection" in event_data and "points" in event_data["selection"]:
+    if event_data and "selection" in event_data and event_data["selection"]["points"]:
         points = event_data["selection"]["points"]
-        if len(points) > 0:
-            new_y = points[0].get("y")
-            if new_y is not None:
-                new_pct = round((new_y / frame_height) * 100, 1)
-                # Bounds check
-                new_pct = max(0.0, min(100.0, new_pct))
+        new_y = points[0].get("y")
+        if new_y is not None:
+            new_pct = round((new_y / frame_height) * 100, 1)
+            # Bounds check
+            new_pct = max(0.0, min(100.0, new_pct))
+            
+            # Update only if different to avoid infinite rerun loops
+            if st.session_state.target_height_pct != new_pct:
                 st.session_state.target_height_pct = new_pct
                 st.rerun()
 
