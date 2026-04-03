@@ -61,6 +61,10 @@ if 'saved_pdf' not in st.session_state:
     st.session_state.saved_pdf = None
 if 'target_height_pct' not in st.session_state:
     st.session_state.target_height_pct = 40.0
+if 'chart_y_min' not in st.session_state:
+    st.session_state.chart_y_min = 0
+if 'chart_y_max' not in st.session_state:
+    st.session_state.chart_y_max = 1080
 if 'video_view_type' not in st.session_state:
     st.session_state.video_view_type = "Side View"
 if 'video_width' not in st.session_state:
@@ -82,7 +86,8 @@ def reset_app_state(rerun=True):
         'active_tracks', 'pause_frame', 'paused', 'next_ball_id',
         'last_frame', 'launch_zone_center', 'launch_zone_radius',
         'analysis_complete', 'files_saved', 'saved_csv', 'saved_chart', 'saved_pdf',
-        'detection_snapshots', 'video_view_type', 'target_height_pct'
+        'detection_snapshots', 'video_view_type', 'target_height_pct',
+        'chart_y_min', 'chart_y_max'
     ]
     for key in keys_to_reset:
         if key in ['raw_trajectories', 'raw_ball_log', 'all_trajectories', 'ball_log', 'active_tracks', 'detection_snapshots']:
@@ -95,6 +100,10 @@ def reset_app_state(rerun=True):
             st.session_state[key] = "Side View"
         elif key == 'target_height_pct':
             st.session_state[key] = 40.0
+        elif key == 'chart_y_min':
+            st.session_state[key] = 0
+        elif key == 'chart_y_max':
+            st.session_state[key] = st.session_state.get('video_height', 1080)
         else:
             st.session_state[key] = None
     
@@ -131,12 +140,21 @@ angle_range = st.sidebar.slider("Launch Angle (°)", -45, 120, (20, 80), 5)
 min_angle, max_angle = angle_range
 st.sidebar.caption(f"Valid: {min_angle}° to {max_angle}°")
 
-height_range = st.sidebar.slider("Max Height (px)", 0, 1200, (0, 1200), 50)
+# Dynamic height filter based on video resolution
+max_v_ht = st.session_state.get('video_height', 1080)
+height_range = st.sidebar.slider("Max Height (px from top)", 0, max_v_ht, (0, max_v_ht), 50)
 min_height, max_height = height_range
 st.sidebar.caption(f"Valid: {min_height} to {max_height} px")
 
 min_velocity = st.sidebar.slider("Min Velocity (px/s)", 0, 100, 10, 5)
 st.sidebar.caption(f"Minimum: {min_velocity} px/s")
+
+st.sidebar.divider()
+st.sidebar.markdown("**🖼️ Chart View**")
+chart_y_range = st.sidebar.slider("Chart Y-Axis Range", 0, max_v_ht, 
+                                 (st.session_state.chart_y_min, st.session_state.chart_y_max), 50)
+st.session_state.chart_y_min, st.session_state.chart_y_max = chart_y_range
+st.sidebar.caption(f"View Window: {st.session_state.chart_y_min} to {st.session_state.chart_y_max} px")
 
 st.sidebar.markdown("**🎯 Target Accuracy**")
 enable_accuracy = st.sidebar.checkbox("Show Accuracy Analysis", value=True)
@@ -284,8 +302,11 @@ def render_trajectory_chart_unified(all_trajs, live_tracks, ball_log, width_dim,
                     ha='center', va='center')
 
     # Autoscale axes to fit data with padding
-    ax.autoscale(enable=True, axis='both', tight=False)
-    ax.margins(0.05)  # 5% padding around data
+    y_min_plot = -st.session_state.chart_y_max
+    y_max_plot = -st.session_state.chart_y_min
+    ax.set_ylim(y_min_plot, y_max_plot)
+    ax.autoscale(enable=True, axis='x', tight=False)
+    ax.margins(x=0.05)  # 5% padding around x data
     graph_plot.pyplot(fig)
 
 def render_summary_unified(df, accuracy_data=None):
@@ -875,10 +896,10 @@ def render_accuracy_analysis(accuracy_data, trajectories, ball_log, target_heigh
     # 1. Plotly Interactive Chart (Top)
     fig_top = go.Figure()
     
-    # Invisible grid of points to capture clicks anywhere
+    # Invisible grid of points to capture clicks anywhere (scaled to current view)
     grid_x, grid_y = np.meshgrid(
         np.linspace(0, frame_width, 20),
-        np.linspace(0, frame_height, 20)
+        np.linspace(st.session_state.chart_y_min, st.session_state.chart_y_max, 20)
     )
     fig_top.add_trace(go.Scatter(
         x=grid_x.flatten(),
@@ -955,7 +976,9 @@ def render_accuracy_analysis(accuracy_data, trajectories, ball_log, target_heigh
         margin=dict(l=10, r=10, t=40, b=10),
         height=400,
         xaxis=dict(title="X Position (px)", gridcolor='#333', fixedrange=True),
-        yaxis=dict(title="Y Position (px)", gridcolor='#333', range=[frame_height, 0], autorange=False, fixedrange=True),
+        yaxis=dict(title="Y Position (px)", gridcolor='#333', 
+                   range=[st.session_state.chart_y_max, st.session_state.chart_y_min], 
+                   autorange=False, fixedrange=True),
         title=dict(text="Trajectories with Target Line (Click to adjust Target)", font=dict(size=14)),
         showlegend=False,
         clickmode='event+select',
