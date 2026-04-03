@@ -19,6 +19,58 @@ MIN_LAUNCH_ZONE_RADIUS = 50  # pixels
 MAX_LAUNCH_ZONE_RADIUS = 200  # pixels
 GRAVITY_ACCEL = 0.5  # pixels per frame squared (estimated)
 
+# --- Initialize session state for persistent data (Must be before UI controls) ---
+if 'raw_trajectories' not in st.session_state:
+    st.session_state.raw_trajectories = []
+if 'raw_ball_log' not in st.session_state:
+    st.session_state.raw_ball_log = []
+if 'all_trajectories' not in st.session_state:
+    st.session_state.all_trajectories = []
+if 'ball_log' not in st.session_state:
+    st.session_state.ball_log = []
+if 'video_path' not in st.session_state:
+    st.session_state.video_path = None
+if 'original_filename' not in st.session_state:
+    st.session_state.original_filename = "video"
+if 'paused' not in st.session_state:
+    st.session_state.paused = False
+if 'pause_frame' not in st.session_state:
+    st.session_state.pause_frame = 0
+if 'last_frame' not in st.session_state:
+    st.session_state.last_frame = None
+if 'active_tracks' not in st.session_state:
+    st.session_state.active_tracks = []
+if 'next_ball_id' not in st.session_state:
+    st.session_state.next_ball_id = 1
+if 'launch_zone_center' not in st.session_state:
+    st.session_state.launch_zone_center = None
+if 'launch_zone_radius' not in st.session_state:
+    st.session_state.launch_zone_radius = None
+if 'detection_snapshots' not in st.session_state:
+    st.session_state.detection_snapshots = []
+if 'analysis_complete' not in st.session_state:
+    st.session_state.analysis_complete = False
+if 'files_saved' not in st.session_state:
+    st.session_state.files_saved = False
+if 'saved_csv' not in st.session_state:
+    st.session_state.saved_csv = None
+if 'saved_chart' not in st.session_state:
+    st.session_state.saved_chart = None
+if 'saved_pdf' not in st.session_state:
+    st.session_state.saved_pdf = None
+if 'target_height_pct' not in st.session_state:
+    st.session_state.target_height_pct = 40.0
+if 'show_accuracy_modal' not in st.session_state:
+    st.session_state.show_accuracy_modal = False
+if 'video_view_type' not in st.session_state:
+    st.session_state.video_view_type = "Side View"
+if 'video_width' not in st.session_state:
+    st.session_state.video_width = 1920
+if 'video_height' not in st.session_state:
+    st.session_state.video_height = 1080
+if 'video_fps' not in st.session_state:
+    st.session_state.video_fps = 30
+
 st.set_page_config(layout="wide")
 st.title("🏹 Advanced Ball Analytics Dashboard")
 
@@ -128,58 +180,6 @@ outlier_sensitivity = 3.0  # launch zone filter sensitivity
 speed = 1.0  # playback speed
 auto_fps = True
 manual_fps = 30
-
-# Initialize session state for persistent data
-if 'raw_trajectories' not in st.session_state:
-    st.session_state.raw_trajectories = []  # RAW data from video analysis (never modified)
-if 'raw_ball_log' not in st.session_state:
-    st.session_state.raw_ball_log = []  # RAW log (never modified)
-if 'all_trajectories' not in st.session_state:
-    st.session_state.all_trajectories = []  # Filtered data for display
-if 'ball_log' not in st.session_state:
-    st.session_state.ball_log = []  # Filtered log for display
-if 'video_path' not in st.session_state:
-    st.session_state.video_path = None
-if 'original_filename' not in st.session_state:
-    st.session_state.original_filename = "video"
-if 'paused' not in st.session_state:
-    st.session_state.paused = False
-if 'pause_frame' not in st.session_state:
-    st.session_state.pause_frame = 0
-if 'last_frame' not in st.session_state:
-    st.session_state.last_frame = None
-if 'active_tracks' not in st.session_state:
-    st.session_state.active_tracks = []
-if 'next_ball_id' not in st.session_state:
-    st.session_state.next_ball_id = 1
-if 'launch_zone_center' not in st.session_state:
-    st.session_state.launch_zone_center = None
-if 'launch_zone_radius' not in st.session_state:
-    st.session_state.launch_zone_radius = None
-if 'detection_snapshots' not in st.session_state:
-    st.session_state.detection_snapshots = []
-if 'analysis_complete' not in st.session_state:
-    st.session_state.analysis_complete = False
-if 'files_saved' not in st.session_state:
-    st.session_state.files_saved = False
-if 'saved_csv' not in st.session_state:
-    st.session_state.saved_csv = None
-if 'saved_chart' not in st.session_state:
-    st.session_state.saved_chart = None
-if 'saved_pdf' not in st.session_state:
-    st.session_state.saved_pdf = None
-if 'target_height_pct' not in st.session_state:
-    st.session_state.target_height_pct = 40.0
-if 'show_accuracy_modal' not in st.session_state:
-    st.session_state.show_accuracy_modal = False
-if 'video_view_type' not in st.session_state:
-    st.session_state.video_view_type = "Side View"
-if 'video_width' not in st.session_state:
-    st.session_state.video_width = 1920
-if 'video_height' not in st.session_state:
-    st.session_state.video_height = 1080
-if 'video_fps' not in st.session_state:
-    st.session_state.video_fps = 30
 
 if st.sidebar.button("Reset All Data"):
     reset_app_state()
