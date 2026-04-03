@@ -880,7 +880,7 @@ def render_accuracy_analysis(accuracy_data, trajectories, ball_log, target_heigh
         x=[0, frame_width, frame_width, 0],
         y=[0, 0, frame_height, frame_height],
         fill="toself",
-        fillcolor="rgba(0,0,0,0)",
+        fillcolor="rgba(255,255,255,0.01)", # Slightly opaque ensures hit-testing works
         line=dict(color="rgba(0,0,0,0)"),
         hoverinfo='none',
         showlegend=False,
@@ -951,15 +951,16 @@ def render_accuracy_analysis(accuracy_data, trajectories, ball_log, target_heigh
         plot_bgcolor='#1e1e1e',
         margin=dict(l=10, r=10, t=40, b=10),
         height=400,
-        xaxis=dict(title="X Position (px)", gridcolor='#333'),
-        yaxis=dict(title="Y Position (px)", gridcolor='#333', range=[frame_height, 0], autorange=False),
-        title=dict(text="Trajectories with Target Line (Interactive)", font=dict(size=14)),
+        xaxis=dict(title="X Position (px)", gridcolor='#333', fixedrange=True),
+        yaxis=dict(title="Y Position (px)", gridcolor='#333', range=[frame_height, 0], autorange=False, fixedrange=True),
+        title=dict(text="Trajectories with Target Line (Click to adjust Target)", font=dict(size=14)),
         showlegend=False,
-        clickmode='event+select'
+        clickmode='event+select',
+        dragmode=False
     )
 
     # Render and capture clicks
-    event_data = st.plotly_chart(fig_top, use_container_width=True, on_select="rerun", key="accuracy_plotly")
+    event_data = st.plotly_chart(fig_top, use_container_width=True, on_select="rerun", key="accuracy_plotly", config={'displayModeBar': False})
 
     # Handle click interaction to set target height
     if event_data and "selection" in event_data and "points" in event_data["selection"]:
