@@ -875,16 +875,19 @@ def render_accuracy_analysis(accuracy_data, trajectories, ball_log, target_heigh
     # 1. Plotly Interactive Chart (Top)
     fig_top = go.Figure()
     
-    # Invisible background to capture clicks anywhere
+    # Invisible grid of points to capture clicks anywhere
+    grid_x, grid_y = np.meshgrid(
+        np.linspace(0, frame_width, 20),
+        np.linspace(0, frame_height, 20)
+    )
     fig_top.add_trace(go.Scatter(
-        x=[0, frame_width, frame_width, 0],
-        y=[0, 0, frame_height, frame_height],
-        fill="toself",
-        fillcolor="rgba(255,255,255,0.01)", # Slightly opaque ensures hit-testing works
-        line=dict(color="rgba(0,0,0,0)"),
+        x=grid_x.flatten(),
+        y=grid_y.flatten(),
+        mode='markers',
+        marker=dict(color="rgba(255,255,255,0.01)", size=20),
         hoverinfo='none',
         showlegend=False,
-        name="bg_click_capture"
+        name="bg_click_grid"
     ))
 
     # Build seq map for labels
@@ -896,11 +899,11 @@ def render_accuracy_analysis(accuracy_data, trajectories, ball_log, target_heigh
         ball_num = ball_id_to_seq.get(track.get('id'), '?')
         color_hex = '#%02x%02x%02x' % (int(track['color'][0]*255), int(track['color'][1]*255), int(track['color'][2]*255))
         
-        # Path trace
+        # Path trace (slightly wider for better clickability)
         fig_top.add_trace(go.Scatter(
             x=pts[:, 0], y=pts[:, 1],
             mode='lines',
-            line=dict(color=color_hex, width=1.5),
+            line=dict(color=color_hex, width=3.0),
             hoverinfo='skip',
             showlegend=False
         ))
