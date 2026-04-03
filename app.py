@@ -985,8 +985,9 @@ def render_accuracy_analysis(accuracy_data, trajectories, ball_log, target_heigh
         dragmode=False
     )
 
-    # Render and capture clicks with a more stable selection mode
-    event_data = st.plotly_chart(fig_top, use_container_width=True, on_select="rerun", key="accuracy_plotly", config={'displayModeBar': False})
+    # Render and capture clicks with a dynamic key to force update on axis change
+    plotly_key = f"accuracy_plotly_{st.session_state.chart_y_min}_{st.session_state.chart_y_max}"
+    event_data = st.plotly_chart(fig_top, use_container_width=True, on_select="rerun", key=plotly_key, config={'displayModeBar': False})
 
     # Handle click interaction to set target height
     if event_data and "selection" in event_data and event_data["selection"]["points"]:
