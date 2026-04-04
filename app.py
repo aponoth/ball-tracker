@@ -449,93 +449,160 @@ def render_summary_unified(df, accuracy_data=None):
     log_table.dataframe(display_df, hide_index=True, use_container_width=True)
 
 def calculate_projected_accuracy(trajectories, ball_log, target_y_px, frame_height):
-    """Project trajectories using reliable early data (launch to apex) and physics.
-    
-    Fits a parabola using GRAVITY_ACCEL to predict landing position.
+    """Project trajectories using physics-based parabolic model.
+
+    Uses actual trajectory data from launch to apogee to fit initial conditions,
+    then projects the descending trajectory using gravity physics.
+
+    Coordinate system: Y=0 at top of frame, Y increases downward
+    - Ball launched upward: Y decreases (vy < 0)
+    - At apex: Y is minimum
+    - Descending: Y increases (vy > 0, gravity accelerates downward)
     """
     projected_intercepts = []
-    
+
     # Create mapping of Ball # to sequential number
     sorted_log = sorted(ball_log, key=lambda x: x['Launch Time (s)'])
     ball_id_to_seq = {entry['Ball #']: i + 1 for i, entry in enumerate(sorted_log)}
 
     for track, log_entry in zip(trajectories, ball_log):
         path = track['path']
-        if len(path) < 5: continue
-        
+        if len(path) < 5:
+            continue
+
         ball_num = ball_id_to_seq.get(track['id'], '?')
         pts = np.array(path)
-        
-        # 1. Identify Reliable Segment (Launch to Apex + 3 frames)
-        # Minimum Y is the apex
+
+        # 1. Identify Reliable Segment: Launch to Apogee (highest point)
+        # In image coordinates, minimum Y is the apex (highest physical point)
         apex_idx = np.argmin(pts[:, 1])
-        # Use data from start up to slightly past apex
-        reliable_end = min(len(pts), apex_idx + 4)
-        reliable_pts = pts[:reliable_end]
-        
-        if len(reliable_pts) < 3: continue
-        
-        # 2. Physics Model Fitting
-        # y(t) = y0 + vy0*t + 0.5*g*t^2
-        # x(t) = x0 + vx*t
-        # We know g = GRAVITY_ACCEL. We solve for vx and vy0.
-        
-        # Time steps (frames)
-        t = np.arange(len(reliable_pts))
-        x = reliable_pts[:, 0]
-        y = reliable_pts[:, 1]
-        
-        # Fit X (linear)
-        vx_fit = np.polyfit(t, x, 1)[0]
-        x0_fit = x[0]
-        
-        # Fit Y (quadratic with fixed gravity)
-        # y - 0.5*g*t^2 = y0 + vy0*t
-        y_adj = y - 0.5 * GRAVITY_ACCEL * (t**2)
-        vy0_fit, y0_fit = np.polyfit(t, y_adj, 1)
-        
-        # 3. Project to Target Height
-        # Solve for t: 0.5*g*t^2 + vy0*t + (y0 - target_y) = 0
+
+        # Use actual trajectory from launch to apex for fitting
+        ascending_pts = pts[:apex_idx + 1]  # Include apex point
+
+        if len(ascending_pts) < 3:
+            continue  # Need at least 3 points for reliable fit
+
+        # 2. Fit Physics Model to Actual Trajectory
+        # Physics equations in image coordinates:
+        #   x(t) = x0 + vx*t  (constant horizontal velocity)
+        #   y(t) = y0 + vy0*t + 0.5*g*t^2  (parabolic with gravity)
+        # Where:
+        #   t = time in frames (0, 1, 2, ...)
+        #   g = GRAVITY_ACCEL (positive, points downward in image coords)
+        #   vy0 = initial vertical velocity (negative for upward launch)
+
+        t = np.arange(len(ascending_pts), dtype=float)
+        x = ascending_pts[:, 0]
+        y = ascending_pts[:, 1]
+
+        # Fit horizontal motion (linear)
+        try:
+            vx_fit = np.polyfit(t, x, 1)[0]
+            x0_fit = x[0]
+        except (np.linalg.LinAlgError, ValueError):
+            continue  # Singular matrix or insufficient data
+
+        # Fit vertical motion (quadratic with known gravity)
+        # Rearrange: y - 0.5*g*t^2 = y0 + vy0*t (linear in t)
+        try:
+            y_adjusted = y - 0.5 * GRAVITY_ACCEL * (t**2)
+            poly_coeffs = np.polyfit(t, y_adjusted, 1)
+            vy0_fit = poly_coeffs[0]  # Initial vertical velocity
+            y0_fit = poly_coeffs[1]   # Initial Y position
+        except (np.linalg.LinAlgError, ValueError):
+            continue
+
+        # 3. Project Descending Trajectory to Target Height
+        # Solve: y(t) = target_y_px
+        # 0.5*g*t^2 + vy0*t + (y0 - target_y_px) = 0
+
         a = 0.5 * GRAVITY_ACCEL
         b = vy0_fit
         c = y0_fit - target_y_px
-        
+
         discriminant = b**2 - 4*a*c
-        if discriminant >= 0:
-            # We want the positive root (descending)
-            t_intercept = (-b + np.sqrt(discriminant)) / (2*a)
-            
-            # Final projected X
-            x_projected = x0_fit + vx_fit * t_intercept
-            
-            projected_intercepts.append({
-                'ball_id': track['id'],
-                'ball_num': ball_num,
-                'x': x_projected,
-                'y': target_y_px,
-                'launch_time': log_entry['Launch Time (s)'],
-                'extrapolated': True,
-                'is_projection': True
-            })
 
-    if not projected_intercepts: return None
+        if discriminant < 0:
+            continue  # No real solution (trajectory doesn't reach target height)
 
-    # Calculate metrics
+        # Quadratic formula gives two roots:
+        # t1 = (-b - √discriminant) / 2a  (ascending phase, smaller t)
+        # t2 = (-b + √discriminant) / 2a  (descending phase, larger t)
+        sqrt_disc = np.sqrt(discriminant)
+        t1 = (-b - sqrt_disc) / (2*a)
+        t2 = (-b + sqrt_disc) / (2*a)
+
+        # We want the DESCENDING intercept (larger t value, after apex)
+        # The apex occurs at t_apex when dy/dt = 0:
+        # dy/dt = vy0 + g*t = 0  =>  t_apex = -vy0 / g
+        t_apex = -vy0_fit / GRAVITY_ACCEL
+
+        # Choose the root that's after apex (descending)
+        if t2 > t_apex and t2 >= 0:
+            t_intercept = t2
+        elif t1 > t_apex and t1 >= 0:
+            t_intercept = t1  # Fallback (shouldn't happen in normal cases)
+        else:
+            continue  # No valid descending intercept
+
+        # Calculate projected X position at target intercept
+        x_projected = x0_fit + vx_fit * t_intercept
+
+        # Validate projection is reasonable (not too far extrapolated)
+        if t_intercept > len(path) * 3:  # More than 3x the actual trajectory length
+            continue  # Unrealistic extrapolation
+
+        projected_intercepts.append({
+            'ball_id': track['id'],
+            'ball_num': ball_num,
+            'x': float(x_projected),  # Ensure Python float
+            'y': target_y_px,
+            'launch_time': log_entry['Launch Time (s)'],
+            'extrapolated': True,
+            'is_projection': True,
+            # Store physics parameters for visualization
+            'physics_params': {
+                'x0': float(x0_fit),
+                'y0': float(y0_fit),
+                'vx': float(vx_fit),
+                'vy0': float(vy0_fit),
+                'apex_idx': int(apex_idx),
+                't_intercept': float(t_intercept)
+            }
+        })
+
+    if not projected_intercepts:
+        return None
+
+    # Calculate accuracy metrics
     x_positions = np.array([i['x'] for i in projected_intercepts])
-    mean_x = np.mean(x_positions)
-    std_x = np.std(x_positions)
+
+    # Validate no NaN values
+    if np.any(np.isnan(x_positions)):
+        st.warning("⚠️ Physics projection produced invalid values (NaN)")
+        return None
+
+    mean_x = float(np.mean(x_positions))
+    std_x = float(np.std(x_positions))
     distances_from_mean = np.abs(x_positions - mean_x)
-    
+
     return {
         'intercepts': projected_intercepts,
         'mean_x': mean_x,
         'std_x': std_x,
-        'cep': np.median(distances_from_mean),
-        'r95': np.percentile(distances_from_mean, 95),
-        'min_x': np.min(x_positions),
-        'max_x': np.max(x_positions),
-        'spread': np.max(x_positions) - np.min(x_positions),
-        'intercept_map': {i['ball_id']: {'target_x': i['x'], 'target_distance': abs(i['x'] - mean_x), 'extrapolated': True} for i in projected_intercepts}
+        'cep': float(np.median(distances_from_mean)),
+        'r95': float(np.percentile(distances_from_mean, 95)),
+        'min_x': float(np.min(x_positions)),
+        'max_x': float(np.max(x_positions)),
+        'spread': float(np.max(x_positions) - np.min(x_positions)),
+        'intercept_map': {
+            i['ball_id']: {
+                'target_x': i['x'],
+                'target_distance': abs(i['x'] - mean_x),
+                'extrapolated': True
+            } for i in projected_intercepts
+        }
     }
 
 def calculate_target_accuracy(trajectories, ball_log, target_y_px, frame_height):
@@ -1025,14 +1092,15 @@ def render_accuracy_analysis(accuracy_data, trajectories, ball_log, target_heigh
         pts = np.array(track['path'])
         ball_num = ball_id_to_seq.get(track.get('id'), '?')
         color_hex = '#%02x%02x%02x' % (int(track['color'][0]*255), int(track['color'][1]*255), int(track['color'][2]*255))
-        
+
         # Path trace (slightly wider for better clickability)
         fig_top.add_trace(go.Scatter(
             x=pts[:, 0], y=pts[:, 1],
             mode='lines',
             line=dict(color=color_hex, width=3.0, dash='solid' if mode=="Actual" else 'dot'),
             hoverinfo='skip',
-            showlegend=False
+            showlegend=False,
+            name=f"Actual {ball_num}"
         ))
 
         # Peak (Apex) marker and label
@@ -1044,9 +1112,52 @@ def render_accuracy_analysis(accuracy_data, trajectories, ball_log, target_heigh
             text=[str(ball_num)],
             textposition="top center",
             textfont=dict(color=color_hex, size=10),
-            name=f"Ball {ball_num}",
+            name=f"Ball {ball_num} (Apex)",
             hoverinfo='text'
         ))
+
+        # For Projected mode: overlay fitted parabolic trajectory
+        if mode == "Projected":
+            # Find the intercept data for this track
+            intercept_data = None
+            for intercept in accuracy['intercepts']:
+                if intercept['ball_id'] == track['id']:
+                    intercept_data = intercept
+                    break
+
+            if intercept_data and 'physics_params' in intercept_data:
+                params = intercept_data['physics_params']
+                x0, y0, vx, vy0 = params['x0'], params['y0'], params['vx'], params['vy0']
+                apex_idx_fit = params['apex_idx']
+                t_intercept = params['t_intercept']
+
+                # Generate parabolic trajectory from launch to projected intercept
+                t_fit = np.linspace(0, t_intercept, 100)
+                x_fit = x0 + vx * t_fit
+                y_fit = y0 + vy0 * t_fit + 0.5 * GRAVITY_ACCEL * (t_fit**2)
+
+                # Plot fitted parabola (entire projected path)
+                fig_top.add_trace(go.Scatter(
+                    x=x_fit, y=y_fit,
+                    mode='lines',
+                    line=dict(color=color_hex, width=2, dash='dash'),
+                    hoverinfo='name',
+                    showlegend=False,
+                    name=f"Physics Projection {ball_num}"
+                ))
+
+                # Highlight the ascending portion (used for fitting) in brighter color
+                t_ascend = np.linspace(0, apex_idx_fit, 50)
+                x_ascend = x0 + vx * t_ascend
+                y_ascend = y0 + vy0 * t_ascend + 0.5 * GRAVITY_ACCEL * (t_ascend**2)
+                fig_top.add_trace(go.Scatter(
+                    x=x_ascend, y=y_ascend,
+                    mode='lines',
+                    line=dict(color='#00ff00', width=3),  # Bright green for fit region
+                    hoverinfo='name',
+                    showlegend=False,
+                    name=f"Fit Region (Launch→Apex) {ball_num}"
+                ))
 
     # Intercepts
     for intercept in accuracy['intercepts']:
@@ -1909,7 +2020,7 @@ if st.session_state.analysis_complete and st.session_state.raw_trajectories:
 
             with tab_projected:
                 if projected_data:
-                    st.info("💡 **How it works**: This uses early flight data (launch to apex) to fit a parabolic path. It filters out deviations caused by collisions with the target.")
+                    st.info("💡 **Physics-Based Projection**: Uses actual trajectory from launch to apex (green) to fit initial velocity and angle. Projects descending path (dashed) using gravity physics. Filters out post-collision deviations.")
                     render_accuracy_analysis(
                         projected_data,
                         st.session_state.all_trajectories,
