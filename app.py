@@ -1205,17 +1205,47 @@ def render_accuracy_analysis(accuracy_data, trajectories, ball_log, target_heigh
         showarrow=False, yshift=10, font=dict(color="Red", size=12)
     )
 
+    # Calculate tight bounds around trajectory data for better zoom
+    all_x = []
+    all_y = []
+    for track in trajectories:
+        pts = np.array(track['path'])
+        all_x.extend(pts[:, 0].tolist())
+        all_y.extend(pts[:, 1].tolist())
+
+    # Include intercepts in bounds calculation
+    for intercept in accuracy['intercepts']:
+        all_x.append(intercept['x'])
+        all_y.append(intercept['y'])
+
+    if all_x and all_y:
+        x_min, x_max = min(all_x), max(all_x)
+        y_min, y_max = min(all_y), max(all_y)
+
+        # Add 10% padding
+        x_range = x_max - x_min
+        y_range = y_max - y_min
+        x_padding = max(x_range * 0.1, 50)  # At least 50px padding
+        y_padding = max(y_range * 0.1, 50)
+
+        x_bounds = [x_min - x_padding, x_max + x_padding]
+        y_bounds = [y_max + y_padding, y_min - y_padding]  # Inverted for image coords
+    else:
+        # Fallback to full frame
+        x_bounds = [0, frame_width]
+        y_bounds = [frame_height, 0]
+
     fig_top.update_layout(
         template="plotly_dark",
         paper_bgcolor='rgba(0,0,0,0)',
         plot_bgcolor='#1e1e1e',
         margin=dict(l=10, r=10, t=40, b=10),
         height=400,
-        xaxis=dict(title="X Position (px)", gridcolor='#333', fixedrange=True),
-        yaxis=dict(title="Y Position (px)", gridcolor='#333', 
-                   range=[st.session_state.chart_y_max, st.session_state.chart_y_min], 
+        xaxis=dict(title="X Position (px)", gridcolor='#333', range=x_bounds, fixedrange=True),
+        yaxis=dict(title="Y Position (px)", gridcolor='#333',
+                   range=y_bounds,
                    autorange=False, fixedrange=True),
-        title=dict(text=f"Trajectories ({mode})", font=dict(size=14)),
+        title=dict(text=f"Trajectories ({mode}) - Autoscaled", font=dict(size=14)),
         showlegend=False,
         clickmode='event+select',
         dragmode=False
