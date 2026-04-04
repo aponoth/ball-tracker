@@ -496,20 +496,24 @@ def calculate_projected_accuracy(trajectories, ball_log, target_y_px, frame_heig
         x = ascending_pts[:, 0]
         y = ascending_pts[:, 1]
 
-        # Fit horizontal motion (linear)
+        # Use actual starting point (ensures perfect overlap at launch)
+        x0_fit = float(x[0])
+        y0_fit = float(y[0])
+
+        # Fit horizontal velocity from position changes relative to start
+        # x(t) - x0 = vx * t  =>  vx = slope of (x - x0) vs t
         try:
-            vx_fit = np.polyfit(t, x, 1)[0]
-            x0_fit = x[0]
+            vx_fit = np.polyfit(t, x - x0_fit, 1)[0]
         except (np.linalg.LinAlgError, ValueError):
             continue  # Singular matrix or insufficient data
 
-        # Fit vertical motion (quadratic with known gravity)
-        # Rearrange: y - 0.5*g*t^2 = y0 + vy0*t (linear in t)
+        # Fit vertical velocity from position changes with gravity
+        # y(t) - y0 = vy0*t + 0.5*g*t^2
+        # Rearrange: (y - y0) - 0.5*g*t^2 = vy0*t
+        # So: vy0 = slope of [(y - y0) - 0.5*g*t^2] vs t
         try:
-            y_adjusted = y - 0.5 * GRAVITY_ACCEL * (t**2)
-            poly_coeffs = np.polyfit(t, y_adjusted, 1)
-            vy0_fit = poly_coeffs[0]  # Initial vertical velocity
-            y0_fit = poly_coeffs[1]   # Initial Y position
+            y_adjusted = (y - y0_fit) - 0.5 * GRAVITY_ACCEL * (t**2)
+            vy0_fit = np.polyfit(t, y_adjusted, 1)[0]
         except (np.linalg.LinAlgError, ValueError):
             continue
 
@@ -1147,16 +1151,20 @@ def render_accuracy_analysis(accuracy_data, trajectories, ball_log, target_heigh
                 ))
 
                 # Highlight the ascending portion (used for fitting) in brighter color
-                t_ascend = np.linspace(0, apex_idx_fit, 50)
+                # apex_idx_fit is the index in the FULL path, which is also the max time value in fit
+                # (since t goes from 0 to apex_idx for ascending_pts which has length apex_idx+1)
+                num_fit_points = apex_idx_fit + 1  # Number of points in ascending_pts
+                t_ascend = np.linspace(0, apex_idx_fit, 100)  # Time values for smooth curve
                 x_ascend = x0 + vx * t_ascend
                 y_ascend = y0 + vy0 * t_ascend + 0.5 * GRAVITY_ACCEL * (t_ascend**2)
                 fig_top.add_trace(go.Scatter(
                     x=x_ascend, y=y_ascend,
                     mode='lines',
-                    line=dict(color='#00ff00', width=3),  # Bright green for fit region
+                    line=dict(color='#00ff00', width=4, dash='solid'),  # Bright green solid for fit region
                     hoverinfo='name',
                     showlegend=False,
-                    name=f"Fit Region (Launch→Apex) {ball_num}"
+                    name=f"Fit Region (Launch→Apex) {ball_num}",
+                    opacity=0.8
                 ))
 
     # Intercepts
