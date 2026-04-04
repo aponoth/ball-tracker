@@ -507,21 +507,30 @@ def calculate_projected_accuracy(trajectories, ball_log, target_y_px, frame_heig
         except (np.linalg.LinAlgError, ValueError):
             continue  # Singular matrix or insufficient data
 
-        # Fit vertical velocity from position changes with gravity
-        # y(t) - y0 = vy0*t + 0.5*g*t^2
-        # Rearrange: (y - y0) - 0.5*g*t^2 = vy0*t
-        # So: vy0 = slope of [(y - y0) - 0.5*g*t^2] vs t
+        # Fit vertical motion as a parabola to get BOTH vy0 AND effective gravity
+        # y(t) = y0 + vy0*t + 0.5*g_eff*t^2
+        # Fit as quadratic: y - y0 = at² + bt  =>  g_eff = 2a, vy0 = b
         try:
-            y_adjusted = (y - y0_fit) - 0.5 * GRAVITY_ACCEL * (t**2)
-            vy0_fit = np.polyfit(t, y_adjusted, 1)[0]
+            y_rel = y - y0_fit  # Position relative to start
+            # Fit quadratic WITHOUT intercept (since we know it starts at 0)
+            # y_rel = vy0*t + 0.5*g*t²
+            coeffs = np.polyfit(t, y_rel, 2)  # Returns [a, b, c] where y = a*t² + b*t + c
+            g_eff = 2 * coeffs[0]  # Effective gravity from quadratic term
+            vy0_fit = coeffs[1]    # Initial velocity from linear term
+
+            # Validate fit quality: intercept should be near zero
+            if abs(coeffs[2]) > 10:  # Intercept should be ~0 since y_rel starts at 0
+                continue  # Poor fit, skip this trajectory
+
         except (np.linalg.LinAlgError, ValueError):
             continue
 
         # 3. Project Descending Trajectory to Target Height
         # Solve: y(t) = target_y_px
-        # 0.5*g*t^2 + vy0*t + (y0 - target_y_px) = 0
+        # y0 + vy0*t + 0.5*g_eff*t² = target_y_px
+        # 0.5*g_eff*t² + vy0*t + (y0 - target_y_px) = 0
 
-        a = 0.5 * GRAVITY_ACCEL
+        a = 0.5 * g_eff  # Use fitted gravity, not constant
         b = vy0_fit
         c = y0_fit - target_y_px
 
@@ -539,8 +548,8 @@ def calculate_projected_accuracy(trajectories, ball_log, target_y_px, frame_heig
 
         # We want the DESCENDING intercept (larger t value, after apex)
         # The apex occurs at t_apex when dy/dt = 0:
-        # dy/dt = vy0 + g*t = 0  =>  t_apex = -vy0 / g
-        t_apex = -vy0_fit / GRAVITY_ACCEL
+        # dy/dt = vy0 + g_eff*t = 0  =>  t_apex = -vy0 / g_eff
+        t_apex = -vy0_fit / g_eff if g_eff != 0 else apex_idx
 
         # Choose the root that's after apex (descending)
         if t2 > t_apex and t2 >= 0:
@@ -571,6 +580,7 @@ def calculate_projected_accuracy(trajectories, ball_log, target_y_px, frame_heig
                 'y0': float(y0_fit),
                 'vx': float(vx_fit),
                 'vy0': float(vy0_fit),
+                'g_eff': float(g_eff),  # Store fitted gravity
                 'apex_idx': int(apex_idx),
                 't_intercept': float(t_intercept)
             }
@@ -1132,13 +1142,14 @@ def render_accuracy_analysis(accuracy_data, trajectories, ball_log, target_heigh
             if intercept_data and 'physics_params' in intercept_data:
                 params = intercept_data['physics_params']
                 x0, y0, vx, vy0 = params['x0'], params['y0'], params['vx'], params['vy0']
+                g_eff = params.get('g_eff', GRAVITY_ACCEL)  # Use fitted gravity
                 apex_idx_fit = params['apex_idx']
                 t_intercept = params['t_intercept']
 
                 # Generate parabolic trajectory from launch to projected intercept
                 t_fit = np.linspace(0, t_intercept, 100)
                 x_fit = x0 + vx * t_fit
-                y_fit = y0 + vy0 * t_fit + 0.5 * GRAVITY_ACCEL * (t_fit**2)
+                y_fit = y0 + vy0 * t_fit + 0.5 * g_eff * (t_fit**2)
 
                 # Plot fitted parabola (entire projected path)
                 fig_top.add_trace(go.Scatter(
@@ -1156,7 +1167,7 @@ def render_accuracy_analysis(accuracy_data, trajectories, ball_log, target_heigh
                 num_fit_points = apex_idx_fit + 1  # Number of points in ascending_pts
                 t_ascend = np.linspace(0, apex_idx_fit, 100)  # Time values for smooth curve
                 x_ascend = x0 + vx * t_ascend
-                y_ascend = y0 + vy0 * t_ascend + 0.5 * GRAVITY_ACCEL * (t_ascend**2)
+                y_ascend = y0 + vy0 * t_ascend + 0.5 * g_eff * (t_ascend**2)
                 fig_top.add_trace(go.Scatter(
                     x=x_ascend, y=y_ascend,
                     mode='lines',
