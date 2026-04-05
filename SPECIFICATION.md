@@ -831,27 +831,7 @@ Ball,Launch Time (s),Initial Velocity (px/s),Launch Angle (°),Max Height (px fr
 
 ## 10. Future Enhancements
 
-### 10.1 Planned Features
-
-**High Priority**:
-1. Multi-color ball detection (not just yellow)
-2. Adaptive color calibration per video
-3. Video codec compatibility improvements
-4. Batch processing mode (multiple videos)
-
-**Medium Priority**:
-5. Real-time mode (webcam input)
-6. Ball spin detection from trajectory curvature
-7. Wind correction model
-8. 3D trajectory reconstruction (stereo cameras)
-
-**Low Priority**:
-9. Machine learning ball detector (vs HSV threshold)
-10. Automated launch zone detection (no manual params)
-11. Export to Excel with charts
-12. Cloud storage integration
-
-### 10.2 Code Quality Improvements
+### 10.1 Code Quality Improvements
 
 **Refactoring**:
 - Modularize into separate files (tracking.py, filtering.py, analysis.py, ui.py)
@@ -872,7 +852,7 @@ Ball,Launch Time (s),Initial Velocity (px/s),Launch Angle (°),Max Height (px fr
 - Cache filter results to avoid recomputation
 - Implement progressive rendering for large datasets
 
-### 10.3 Known Issues
+### 10.2 Known Issues
 
 1. **Memory leak potential**: Matplotlib figure reused globally (intentional for performance)
 2. **OpenCV version compatibility**: Handled but requires -2 index workaround
